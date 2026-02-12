@@ -153,7 +153,7 @@ bash scripts/Wise/wise_reward_wise_cultural_common_sense.sh
 ```bibtex
 @article{mi2025milr,
   title={MILR: Improving Multimodal Image Generation via Test-Time Latent Reasoning},
-  author={Mi, Yapeng and Li, Hengli and Zhao, Yanpeng and Li, Chenxi and Wu, Huimin and Ma, Xiaojian and Zhu, Song-Chun and Wu, Ying Nian and Li, Qing},
+  author={Mi, Yapeng and Zhao, Yanpeng and Li, Hengli and Li, Chenxi and Wu, Huimin and Ma, Xiaojian and Zhu, Song-Chun and Wu, Ying Nian and Li, Qing},
   journal={arXiv preprint arXiv:2509.22761},
   year={2025}
 }
