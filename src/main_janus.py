@@ -70,7 +70,7 @@ def main(args):
     if args.reward_model_type == "geneval":
         from rewards.reward import RewardModel
         reward_model = RewardModel(
-            model_path="rewards/<OBJECT_DETECTOR_FOLDER>",
+            model_path="rewards/object_detector",
             object_names_path="rewards/object_names.txt",
             options={"clip_model": "ViT-L-14"}
         )

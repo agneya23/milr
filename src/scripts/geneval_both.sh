@@ -12,6 +12,8 @@ max_text_steps=20
 max_image_steps=20
 max_both_steps=20
 
+cd '/ivi/zfs/s0/original_homes/ydu/PythonWorkSpace/agneya/milr/src'
+
 if ! [ -e $output_dir ]; then
     mkdir -p $output_dir
 fi
