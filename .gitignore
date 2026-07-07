@@ -197,3 +197,5 @@ src/Bagel/rewards/MixedReward/reward_weights
 src/Bagel/rewards/T2ICompBench/UniDet_eval/experts/expert_weights
 
 src/WISE/
+
+papers/
