@@ -16,9 +16,9 @@ class Data():
                 data = [json.loads(line) for line in f if line.strip()]
             tags = list(set([data_pt["tag"] for data_pt in data]))
         elif self.dataset_name == "T2I-CompBench":
-            pass
+            raise Exception("Not yet implemented...")
         elif self.dataset_name == "Wise":
-            pass
+            raise Exception("Not yet implemented...")
         num_tags = len(tags)
         # Sample tasks for meta-optimization
         meta_tasks = random.sample(tags, k=int(num_tags*self.meta_tasks_frac))
@@ -36,6 +36,7 @@ class Data():
                 )
             )
         self.meta_data_test = [meta_datapt for meta_datapt in meta_data if meta_datapt not in self.meta_data_train]
+        return self.meta_data_train, self.meta_data_test
 
     def get_data(self, mode="train"):
         if mode == "train":
