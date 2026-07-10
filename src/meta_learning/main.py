@@ -4,7 +4,8 @@ from ..process import get_dataset, save_image_and_metadata, set_seed
 from data import Data
 import tqdm
 import os
-from ori_generation_janus import original_generation
+from ..ori_generation_janus import original_generation
+from ..opt_generation_janus import optimized_generation
 
 def parse_args():
     parser = argparse.ArgumentParser()
