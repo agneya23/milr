@@ -5,7 +5,8 @@ from data import Data
 import tqdm
 import os
 from ..ori_generation_janus import original_generation
-from ..opt_generation_janus import optimized_generation
+from meta_opt_gen_janus import mod_optimized_generation
+from meta_learning import *
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -120,7 +121,7 @@ def main(args):
         if img is not None:
             save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
         torch.cuda.empty_cache()
-        new_img, reward_history, ori_total_length, generated_seq, update_length = optimized_generation(
+        new_img, reward_history, ori_total_length, generated_seq, update_length, diff_text_states, diff_img_states, update_length, img_update_length = mod_optimized_generation(
                 reward_model=reward_model,
                 image=img,
                 data=example,
@@ -145,11 +146,17 @@ def main(args):
                 save_base_path = os.path.join(output_dir, "opt_history", str(i).zfill(4)),
         )
 
-        if new_img is not None:
-            save_image_and_metadata(new_img, example, os.path.join(output_dir, "opt_img"), i,data_name)
-        final_img = new_img if new_img is not None else img
-        if final_img is not None:
-            save_image_and_metadata(final_img, example, os.path.join(output_dir, "final_img"), i, data_name)
+        img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = meta_learning_func(
+                input_text=prompt,
+                model=vl_gpt,
+                vl_chat_processor=vl_chat_processor,
+                optimize_mode = args.optimize_mode,
+                device=device,
+                diff_text_states=diff_text_states, 
+                diff_img_states=diff_img_states,
+                update_length=update_length,
+                img_update_length=img_update_length
+                )
 
         update_count += (len(reward_history) - 1)   
         
