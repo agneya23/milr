@@ -121,7 +121,7 @@ def main(args):
         if img is not None:
             save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
         torch.cuda.empty_cache()
-        new_img, reward_history, ori_total_length, generated_seq, update_length, diff_text_states, diff_img_states, update_length, img_update_length = mod_optimized_generation(
+        new_img, reward_history, ori_total_length, generated_seq, updated_length, diff_text_states, diff_img_states, text_update_length, img_update_length = mod_optimized_generation(
                 reward_model=reward_model,
                 image=img,
                 data=example,
@@ -147,6 +147,8 @@ def main(args):
         )
 
         img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = meta_learning_func(
+                reward_model=reward_model,
+                data=example,
                 input_text=prompt,
                 model=vl_gpt,
                 vl_chat_processor=vl_chat_processor,
@@ -154,7 +156,7 @@ def main(args):
                 device=device,
                 diff_text_states=diff_text_states, 
                 diff_img_states=diff_img_states,
-                update_length=update_length,
+                text_update_length=text_update_length,
                 img_update_length=img_update_length
                 )
 
