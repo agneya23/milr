@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from ..janus.models import MultiModalityCausalLM, VLChatProcessor
 
 def meta_learning_func(
     reward_model,
@@ -9,6 +10,8 @@ def meta_learning_func(
     vl_chat_processor: VLChatProcessor,       # Should be of type VLChatProcessor
     optimize_mode: str,
     device: torch.device,
+    lr: int,
+    train_iterations: int = 100,
     parallel_size: int = 1,
     temperature: float = 1.0,
     cfg_weight: float = 5.0,
@@ -56,115 +59,137 @@ def meta_learning_func(
     text_hidden_states_list = []
     generated_text_ids = []
 
-    for i in range(max_text_tokens):
-        # generate normal outputs
-        # with torch.no_grad():
-        outputs = model.language_model.model(current_input_ids, output_hidden_states=True)
-        last_hidden_state = outputs[0][:, -1]  # [B, hidden_dim]
-        milr_last_hidden_state = last_hidden_state+diff_text_states[i]
-        text_hidden_states_list.append(milr_last_hidden_state.clone())
-        # detach + requires_grad
-        # last_hidden_state = last_hidden_state.detach()
-        # last_hidden_state.requires_grad = True
-        # if last_hidden_state.grad is not None:
-        #     last_hidden_state.grad.zero_()
-        # generate token
-        # with torch.no_grad():
-        logits = model.language_model.lm_head(milr_last_hidden_state)
-        next_token_id = torch.argmax(logits, dim=-1)  # [1, 1]
-        new_token = tokenizer.decode(next_token_id.item(), skip_special_tokens=False)
-        generated_text_ids.append(next_token_id.item())
-        # check if finished
-        if new_token in stop_words:
-            break
+    model_optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-        current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=-1)
+    for it in range(train_iterations):
+        model_optimizer.zero_grad()
 
-    # final answer
-    text_final_input_ids = current_input_ids.clone().clone().cpu()
-    enhanced_text = tokenizer.decode(generated_text_ids, skip_special_tokens=True)
+        text_loss = 0
 
-    # ========================================================================
-    # Part 2: Image Generation & Hidden State Extraction
-    # ========================================================================
-    if optimize_mode == "image":
-        image_gen_prompt = f"{input_text}"
-    else:
-        image_gen_prompt = f"{input_text}. {enhanced_text}"
+        for i in range(max_text_tokens):
+            # generate normal outputs
+            # with torch.no_grad():
+            outputs = model.language_model.model(current_input_ids, output_hidden_states=True)
+            last_hidden_state = outputs[0][:, -1]  # [B, hidden_dim]
+            try:
+                milr_last_hidden_state = last_hidden_state+diff_text_states[i]
+            except:
+                milr_last_hidden_state = last_hidden_state
+            text_hidden_states_list.append(milr_last_hidden_state.clone())
+            # detach + requires_grad
+            # last_hidden_state = last_hidden_state.detach()
+            # last_hidden_state.requires_grad = True
+            # if last_hidden_state.grad is not None:
+            #     last_hidden_state.grad.zero_()
+            # generate token
+            # with torch.no_grad():
+            logits = model.language_model.lm_head(milr_last_hidden_state)
+            next_token_id = torch.argmax(logits, dim=-1)  # [1, 1]
+            probs = torch.softmax(logits, dim=-1) + 1e-8
+            log_pi = torch.log(probs[0, 0, next_token_id] + 1e-10)
+            text_loss -= log_pi.sum()
+            new_token = tokenizer.decode(next_token_id.item(), skip_special_tokens=False)
+            generated_text_ids.append(next_token_id.item())
+            # check if finished
+            if new_token in stop_words:
+                break
 
-    img_gen_conversation = [{"role": "User", "content": image_gen_prompt}, {"role": "Assistant", "content": ""}]
-    sft_image_prompt = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
-        conversations=img_gen_conversation, sft_format=vl_chat_processor.sft_format, system_prompt=""
-    )
+            current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=-1)
 
-    prompt_inputs = tokenizer(
-        text=[sft_image_prompt], return_tensors="pt", padding=True, padding_side="right", add_special_tokens=True
-    )
-    image_prompt_ids = prompt_inputs["input_ids"].to(device)
-    attention_mask = prompt_inputs["attention_mask"].to(device)
+        # final answer
+        text_final_input_ids = current_input_ids.clone().clone().cpu()
+        enhanced_text = tokenizer.decode(generated_text_ids, skip_special_tokens=True)
 
-    image_start_token_id = tokenizer.encode(vl_chat_processor.image_start_tag)[1]
-    image_prompt_ids = torch.cat([image_prompt_ids, image_prompt_ids.new_full((image_prompt_ids.size(0), 1), image_start_token_id)], dim=1)
-    attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.size(0), 1))], dim=1)
+        # ========================================================================
+        # Part 2: Image Generation & Hidden State Extraction
+        # ========================================================================
+        if optimize_mode == "image":
+            image_gen_prompt = f"{input_text}"
+        else:
+            image_gen_prompt = f"{input_text}. {enhanced_text}"
 
-    image_prompt_ids = image_prompt_ids.repeat(parallel_size, 1)
-    attention_mask = attention_mask.repeat(parallel_size, 1)
-
-    cond_inputs_embeds = model.language_model.get_input_embeddings()(image_prompt_ids)
-    pad_input_embeds = model.language_model.get_input_embeddings()(image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id))
-
-    uncond_inputs_embeds = cond_inputs_embeds.clone()
-    uncond_inputs_embeds[:,1:-1] = pad_input_embeds
-
-    inputs_embeds_img = torch.repeat_interleave(cond_inputs_embeds, 2, dim=0)
-    inputs_embeds_img[1::2] = uncond_inputs_embeds
-
-    attention_mask_img = torch.repeat_interleave(attention_mask, 2, dim=0)
-    attention_mask_img[1::2] = torch.ones_like(attention_mask_img[1::2])
-
-    generated_image_tokens = torch.zeros((parallel_size, image_token_num), dtype=torch.int, device=device)
-    image_hidden_states_list = []
-    current_img_embeds = inputs_embeds_img
-    past_key_values = None
-
-    for k in range(image_token_num):
-        # with torch.no_grad():
-        outputs = model.language_model.model(
-            inputs_embeds=current_img_embeds,
-            use_cache=True,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask_img
+        img_gen_conversation = [{"role": "User", "content": image_gen_prompt}, {"role": "Assistant", "content": ""}]
+        sft_image_prompt = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=img_gen_conversation, sft_format=vl_chat_processor.sft_format, system_prompt=""
         )
-        past_key_values = outputs.past_key_values
-        hidden_states = outputs.last_hidden_state
-        hidden_states = hidden_states[:, -1, :]
-        milr_hidden_states = hidden_states+diff_img_states[k]
-        
-        image_hidden_states_list.append(milr_hidden_states.clone().cpu())
-        
-        logits = model.gen_head(milr_hidden_states)
-        logit_cond = logits[0::2, :]
-        logit_uncond = logits[1::2, :]
-        logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
-        
-        probs = torch.softmax(logits/temperature, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        generated_image_tokens[:, k] = next_token.squeeze(dim=-1)
-        next_token = next_token.repeat(1, 2).view(-1)
-        current_img_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1)
-        attention_mask_img = torch.cat([attention_mask_img, attention_mask_img.new_ones((attention_mask_img.size(0), 1), dtype=torch.int)], dim=1)
 
-    with torch.no_grad():
-        dec = model.gen_vision_model.decode_code(generated_image_tokens.to(dtype=torch.int), shape=[parallel_size, 8, img_size//patch_size, img_size//patch_size])
+        prompt_inputs = tokenizer(
+            text=[sft_image_prompt], return_tensors="pt", padding=True, padding_side="right", add_special_tokens=True
+        )
+        image_prompt_ids = prompt_inputs["input_ids"].to(device)
+        attention_mask = prompt_inputs["attention_mask"].to(device)
 
-    dec = dec.to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
-    dec = np.clip((dec + 1) / 2 * 255, 0, 255)
+        image_start_token_id = tokenizer.encode(vl_chat_processor.image_start_tag)[1]
+        image_prompt_ids = torch.cat([image_prompt_ids, image_prompt_ids.new_full((image_prompt_ids.size(0), 1), image_start_token_id)], dim=1)
+        attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.size(0), 1))], dim=1)
 
-    visual_img = np.zeros((parallel_size, img_size, img_size, 3), dtype=np.uint8)
-    visual_img[:, :, :] = dec
+        image_prompt_ids = image_prompt_ids.repeat(parallel_size, 1)
+        attention_mask = attention_mask.repeat(parallel_size, 1)
 
-    answer = Image.fromarray(visual_img[0])
+        cond_inputs_embeds = model.language_model.get_input_embeddings()(image_prompt_ids)
+        pad_input_embeds = model.language_model.get_input_embeddings()(image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id))
 
-    reward = reward_model.get_reward(answer, data)
+        uncond_inputs_embeds = cond_inputs_embeds.clone()
+        uncond_inputs_embeds[:,1:-1] = pad_input_embeds
+
+        inputs_embeds_img = torch.repeat_interleave(cond_inputs_embeds, 2, dim=0)
+        inputs_embeds_img[1::2] = uncond_inputs_embeds
+
+        attention_mask_img = torch.repeat_interleave(attention_mask, 2, dim=0)
+        attention_mask_img[1::2] = torch.ones_like(attention_mask_img[1::2])
+
+        generated_image_tokens = torch.zeros((parallel_size, image_token_num), dtype=torch.int, device=device)
+        image_hidden_states_list = []
+        current_img_embeds = inputs_embeds_img
+        past_key_values = None
+
+        img_loss = 0
+
+        for k in range(image_token_num):
+            # with torch.no_grad():
+            outputs = model.language_model.model(
+                inputs_embeds=current_img_embeds,
+                use_cache=True,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask_img
+            )
+            past_key_values = outputs.past_key_values
+            hidden_states = outputs.last_hidden_state
+            hidden_states = hidden_states[:, -1, :]
+            milr_hidden_states = hidden_states+diff_img_states[k]
+            
+            image_hidden_states_list.append(milr_hidden_states.clone().cpu())
+            
+            logits = model.gen_head(milr_hidden_states)
+            logit_cond = logits[0::2, :]
+            logit_uncond = logits[1::2, :]
+            logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
+            
+            probs = torch.softmax(logits/temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            log_pi = torch.log(probs[0, next_token] + 1e-10)
+            img_loss -= log_pi.sum()
+            generated_image_tokens[:, k] = next_token.squeeze(dim=-1)
+            next_token = next_token.repeat(1, 2).view(-1)
+            current_img_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1)
+            attention_mask_img = torch.cat([attention_mask_img, attention_mask_img.new_ones((attention_mask_img.size(0), 1), dtype=torch.int)], dim=1)
+
+        with torch.no_grad():
+            dec = model.gen_vision_model.decode_code(generated_image_tokens.to(dtype=torch.int), shape=[parallel_size, 8, img_size//patch_size, img_size//patch_size])
+
+        dec = dec.to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
+        dec = np.clip((dec + 1) / 2 * 255, 0, 255)
+
+        visual_img = np.zeros((parallel_size, img_size, img_size, 3), dtype=np.uint8)
+        visual_img[:, :, :] = dec
+
+        answer = Image.fromarray(visual_img[0])
+
+        reward = reward_model.get_reward(answer, data)
+
+        total_loss = (text_loss + img_loss)*reward
+
+        total_loss.backward()
+        model_optimizer.step()
 
     return answer, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, inputs_embeds_img.cpu(), image_gen_prompt

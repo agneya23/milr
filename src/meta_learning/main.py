@@ -154,6 +154,7 @@ def main(args):
                 vl_chat_processor=vl_chat_processor,
                 optimize_mode = args.optimize_mode,
                 device=device,
+                lr=args.lr,
                 diff_text_states=diff_text_states, 
                 diff_img_states=diff_img_states,
                 text_update_length=text_update_length,

@@ -8,9 +8,9 @@ import PIL.Image
 import json
 import random
 
-from process import save_image_and_metadata
-from ori_generation_janus import original_generation
-from janus.models import MultiModalityCausalLM, VLChatProcessor
+from ..process import save_image_and_metadata
+from ..ori_generation_janus import original_generation
+from ..janus.models import MultiModalityCausalLM, VLChatProcessor
 from transformers import AutoModelForCausalLM
 
 from rewards.reward import RewardModel
