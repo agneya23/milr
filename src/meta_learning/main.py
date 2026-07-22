@@ -25,8 +25,8 @@ def parse_args():
     parser.add_argument("--max_image_steps", type=int, default=10, help="Number of image optimization iterations")
     parser.add_argument("--max_new_tokens", type=int, default=512, help="Number of generated tokens")
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--meta_tasks_frac", type=float, default=0.5, help="Fraction of tasks to reserve for meta-optimization")
-    parser.add_argument("--meta_tasks_data_frac", type=float, default=0.5, help="Fraction of datapoints to reserve for inner loop of meta-optimization")
+    # parser.add_argument("--meta_tasks_frac", type=float, default=0.5, help="Fraction of tasks to reserve for meta-optimization")
+    # parser.add_argument("--meta_tasks_data_frac", type=float, default=0.5, help="Fraction of datapoints to reserve for inner loop of meta-optimization")
     return parser.parse_args()
 
 def main(args):
@@ -77,8 +77,10 @@ def main(args):
            device="cuda:0",
         )
     
-    data_class = Data(args)
-    meta_data_train, meta_data_test = data_class.prepare_data()
+    # data_class = Data(args)
+    # meta_data_train, meta_data_test = data_class.prepare_data()
+
+    dataset = get_dataset(args.dataset,args.task_type,args.data_name)
 
     original_correct = 0
     optimized_correct = 0
@@ -100,7 +102,7 @@ def main(args):
         args.max_both_steps = 30
         output_dir = f"{args.output_dir}/{model_name}-{data_name}-{args.reward_model_type}-{args.optimize_mode}-text_k{args.text_k}-image_k{args.image_k}-steps{args.max_both_steps}-lr{args.lr}-reward_threshold{args.reward_threshold}"
 
-    for i in tqdm(range(len(meta_data_train))):
+    for i in tqdm(range(len(dataset))):
         example = dataset[i]
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)

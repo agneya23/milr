@@ -699,9 +699,9 @@ def mod_optimized_generation(**kwargs):
                         f.write("\n")
                     print(f"Trace saved: {trace_file}, image at: {img_save_path}")
 
-            return new_img, reward_history, total_img+total, image_token_num+len(generated_seq), img_update_length+update_length
+            return new_img, reward_history, total_img+total, image_token_num+len(generated_seq), img_update_length+update_length, update_length, img_update_length, optimized_states, optimized_states_img
     
-    new_img, reward_history, ori_total_length, generated_seq, updated_length = optimized_generation(**kwargs)
+    new_img, reward_history, ori_total_length, generated_seq, updated_length, update_length, img_update_length, optimized_states, optimized_states_img = optimized_generation(**kwargs)
     
     ori_text_states = kwargs['text_hidden_states_list'][kwargs['start_index'] : min(kwargs['start_index'] + update_length, len(kwargs['text_hidden_states_list']))]
     ori_img_states = kwargs['image_hidden_states_list'][kwargs['start_index'] : min(kwargs['start_index'] + img_update_length, len(kwargs['image_hidden_states_list']))]

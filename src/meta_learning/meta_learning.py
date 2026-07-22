@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from ..janus.models import MultiModalityCausalLM, VLChatProcessor
+import os
 
 def meta_learning_func(
     reward_model,
@@ -22,7 +23,8 @@ def meta_learning_func(
     diff_text_states: list=None,
     diff_img_states: list=None,
     text_update_length: int=None,
-    img_update_length: int=None
+    img_update_length: int=None,
+    save_interval=10
 ):
     tokenizer = vl_chat_processor.tokenizer
     stop_words = {"</s>", "<|im_end|>", "<|endoftext|>", tokenizer.eos_token}
@@ -156,7 +158,10 @@ def meta_learning_func(
             past_key_values = outputs.past_key_values
             hidden_states = outputs.last_hidden_state
             hidden_states = hidden_states[:, -1, :]
-            milr_hidden_states = hidden_states+diff_img_states[k]
+            try:
+                milr_hidden_states = hidden_states+diff_img_states[k]
+            except:
+                milr_hidden_states = hidden_states
             
             image_hidden_states_list.append(milr_hidden_states.clone().cpu())
             
@@ -191,5 +196,9 @@ def meta_learning_func(
 
         total_loss.backward()
         model_optimizer.step()
+
+        if it % save_interval == 0:
+            os.mkdir("./checkpoints/") if not os.path.exists("./checkpoints/") else None
+            torch.save(model.state_dict(), "./checkpoints/model_{}/".format(it))
 
     return answer, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, inputs_embeds_img.cpu(), image_gen_prompt
