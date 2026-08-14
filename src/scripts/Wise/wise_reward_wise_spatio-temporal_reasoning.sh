@@ -15,6 +15,12 @@ max_image_steps=20
 max_both_steps=20
 seed=41
 
+cd '/ivi/zfs/s0/original_homes/ydu/PythonWorkSpace/agneya/milr/src'
+
+if ! [ -e "$output_dir" ]; then
+    mkdir -p "$output_dir"
+fi
+
 # === set log file name ===
 if [ "$optimize_mode" = "text" ]; then
     LOG_FILE="$output_dir/${optimize_mode}_tk${text_k}_lr${lr}_ts${max_text_steps}.txt"
@@ -23,6 +29,9 @@ elif [ "$optimize_mode" = "image" ]; then
 else
     LOG_FILE="$output_dir/${optimize_mode}_tk${text_k}_ik${image_k}_lr${lr}_bs${max_both_steps}.txt"
 fi
+
+source /ivi/zfs/s0/original_homes/ydu/miniconda3/bin/activate
+conda activate /ivi/zfs/s0/original_homes/ydu/miniconda3/envs/milr_latentseek/
 
 # === start training script ===
 CUDA_VISIBLE_DEVICES=0 python main_janus.py \
