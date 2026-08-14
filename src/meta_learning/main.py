@@ -102,93 +102,60 @@ def main(args):
         args.max_both_steps = 30
         output_dir = f"{args.output_dir}/{model_name}-{data_name}-{args.reward_model_type}-{args.optimize_mode}-text_k{args.text_k}-image_k{args.image_k}-steps{args.max_both_steps}-lr{args.lr}-reward_threshold{args.reward_threshold}"
 
-    for i in tqdm(range(len(dataset))):
-        example = dataset[i]
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
 
-        prompt = example["prompt"]
-        task_tag = example["tag"]
+    for it in range(args.train_iterations):
+        for i in tqdm(range(len(dataset))):
+            example = dataset[i]
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
 
-        if prompt is None:
-            continue
+            prompt = example["prompt"]
+            task_tag = example["tag"]
 
-        img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = original_generation(
-                input_text=prompt,
+            if prompt is None:
+                continue
+
+            img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = original_generation(
+                    input_text=prompt,
+                    model=vl_gpt,
+                    vl_chat_processor=vl_chat_processor,
+                    optimize_mode = args.optimize_mode,
+                    device=device)
+            # save original image and metadata
+            if img is not None:
+                save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
+            torch.cuda.empty_cache()
+
+            meta_milr(
+                reward_model=reward_model,
+                image=img,
+                data=example,
                 model=vl_gpt,
-                vl_chat_processor=vl_chat_processor,
+                vl_chat_processor = vl_chat_processor,
+                device=device,
+                text_hidden_states_list=text_hidden_states_list,
+                text_final_input_ids=text_final_input_ids,
+                image_hidden_states_list=image_hidden_states_list,
+                image_prompt_embed=image_prompt_embed,
+                ori_image_prompt=ori_image_prompt,
+                max_text_steps=args.max_text_steps,
+                max_image_steps=args.max_image_steps,
+                max_both_steps=args.max_both_steps,
+                lr=args.lr,
+                grad_clip=args.grad_clip,
+                text_k=args.text_k,
+                image_k=args.image_k,
+                reward_threshold=args.reward_threshold,
+                max_text_tokens=args.max_new_tokens,
                 optimize_mode = args.optimize_mode,
-                device=device)
-        # save original image and metadata
-        if img is not None:
-            save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
-        torch.cuda.empty_cache()
+                save_base_path = os.path.join(output_dir, "opt_history", str(i).zfill(4)),
+                train_iterations=train_iterations,
+                save_interval=save_interval
+            )
 
-        meta_milr(
-            reward_model=reward_model,
-            image=img,
-            data=example,
-            model=vl_gpt,
-            vl_chat_processor = vl_chat_processor,
-            device=device,
-            text_hidden_states_list=text_hidden_states_list,
-            text_final_input_ids=text_final_input_ids,
-            image_hidden_states_list=image_hidden_states_list,
-            image_prompt_embed=image_prompt_embed,
-            ori_image_prompt=ori_image_prompt,
-            max_text_steps=args.max_text_steps,
-            max_image_steps=args.max_image_steps,
-            max_both_steps=args.max_both_steps,
-            lr=args.lr,
-            grad_clip=args.grad_clip,
-            text_k=args.text_k,
-            image_k=args.image_k,
-            reward_threshold=args.reward_threshold,
-            max_text_tokens=args.max_new_tokens,
-            optimize_mode = args.optimize_mode,
-            save_base_path = os.path.join(output_dir, "opt_history", str(i).zfill(4)),
-            train_iterations=train_iterations
-        )
-
-        # new_img, reward_history, ori_total_length, generated_seq, updated_length, diff_text_states, diff_img_states, text_update_length, img_update_length = mod_optimized_generation(
-        #         reward_model=reward_model,
-        #         image=img,
-        #         data=example,
-        #         model=vl_gpt,
-        #         vl_chat_processor = vl_chat_processor,
-        #         device=device,
-        #         text_hidden_states_list=text_hidden_states_list,
-        #         text_final_input_ids=text_final_input_ids,
-        #         image_hidden_states_list=image_hidden_states_list,
-        #         image_prompt_embed=image_prompt_embed,
-        #         ori_image_prompt=ori_image_prompt,
-        #         max_text_steps=args.max_text_steps,
-        #         max_image_steps=args.max_image_steps,
-        #         max_both_steps=args.max_both_steps,
-        #         lr=args.lr,
-        #         grad_clip=args.grad_clip,
-        #         text_k=args.text_k,
-        #         image_k=args.image_k,
-        #         reward_threshold=args.reward_threshold,
-        #         max_text_tokens=args.max_new_tokens,
-        #         optimize_mode = args.optimize_mode,
-        #         save_base_path = os.path.join(output_dir, "opt_history", str(i).zfill(4)),
-        # )
-
-        # img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = meta_learning_func(
-        #         reward_model=reward_model,
-        #         data=example,
-        #         input_text=prompt,
-        #         model=vl_gpt,
-        #         vl_chat_processor=vl_chat_processor,
-        #         optimize_mode = args.optimize_mode,
-        #         device=device,
-        #         lr=args.lr,
-        #         diff_text_states=diff_text_states, 
-        #         diff_img_states=diff_img_states,
-        #         text_update_length=text_update_length,
-        #         img_update_length=img_update_length
-        #         )
+        if it % args."save_interval" == 0:
+            os.mkdir("./checkpoints/model_{}/".format(it)) if not os.path.exists("./checkpoints/model_{}/".format(it)) else None
+            torch.save(model.state_dict(), "./checkpoints/model_{}/".format(it))
 
         update_count += (len(reward_history) - 1)   
         

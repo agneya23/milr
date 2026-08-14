@@ -518,7 +518,7 @@ def milr(
         optimized_states = torch.nn.Parameter(
             torch.stack(
                 [
-                    s.clone().detach().requires_grad_(True)
+                    s.clone().requires_grad_(True)
                     for s in text_hidden_states_list[
                         start_index : min(start_index + update_length, len(text_hidden_states_list))
                     ]
@@ -537,7 +537,7 @@ def milr(
         optimized_states_img = torch.nn.Parameter(
             torch.stack(
                 [
-                    s.clone().detach().to(device).requires_grad_(True)
+                    s.clone().to(device).requires_grad_(True)
                     for s in image_hidden_states_list[start_index:start_index + img_update_length]
                 ]
             )
@@ -548,7 +548,8 @@ def milr(
         new_img = None
         generated_seq = []
 
-        for i in range(max_both_steps):
+        last_iter = max_both_steps
+        for i in range(max_both_steps+1):
             if current_reward > reward_threshold:
                 break
             # optimizer_text.zero_grad()
@@ -560,15 +561,13 @@ def milr(
                 probs[torch.arange(update_length), 0, next_token_ids] + 1e-10
             )
             text_loss = -current_reward * log_pi.sum()
-            text_log_pi = log_pi
+            if i == last_iter:
+                text_log_pi = log_pi.sum()
             print(f"-- Both Text Opt Loss: {text_loss.item()}")
-            # text_loss.backward(retain_graph=True)
-            grad_optimized_states = torch.autograd.grad(text_loss, optimized_states, create_graph=True)
-            # if grad_clip:
-            #     torch.nn.utils.clip_grad_norm_([optimized_states], grad_clip)
-            # optimizer_text.step()
-            for row in range(len(optimized_states)):
-                optimized_states[row] -= lr*grad_optimized_states[row]
+            if i != last_iter:
+                grad_optimized_states = torch.autograd.grad(text_loss, optimized_states, create_graph=True)
+                for row in range(len(optimized_states)):
+                    optimized_states[row] -= lr*grad_optimized_states[row]
 
             # with torch.no_grad():
             updated_probs = torch.softmax(model.language_model.lm_head(optimized_states), dim=-1)
@@ -585,7 +584,12 @@ def milr(
                     updated_input_ids, output_hidden_states=True
                 )
                 last_hidden = outputs[0][:, -1, :]
-                next_token_id = torch.argmax(model.language_model.lm_head(last_hidden), dim=-1)
+                logits = model.language_model.lm_head(last_hidden)
+                probs = torch.softmax(logits, dim=-1) + 1e-8
+                next_token_id = torch.argmax(probs, dim=-1)
+                log_pi = torch.log(probs[0, 0, next_token_id] + 1e-10)
+                if i == last_iter:
+                    text_log_pi += log_pi
                 token_str = tokenizer.decode(next_token_id.item())
                 generated_seq.append(next_token_id.item())
                 updated_input_ids = torch.cat([updated_input_ids, next_token_id.unsqueeze(0)], dim=-1)
@@ -627,13 +631,13 @@ def milr(
             log_pi = torch.log(probs[torch.arange(img_update_length), token_ids] + 1e-10)
 
             image_loss = -current_reward * log_pi.sum()
-            image_log_pi = log_pi
+            if i == last_iter:
+                image_log_pi = log_pi
             print(f"-- Both Image Opt Loss: {image_loss.item()}")
-            # image_loss.backward()
-            # optimizer_img.step()
-            grad_optimized_states_img = torch.autograd.grad(image_loss, optimized_states_img, create_graph=True)
-            for row in range(len(optimized_states_img)):
-                optimized_states_img[row] -= lr*grad_optimized_states_img[row]
+            if i != last_iter:
+                grad_optimized_states_img = torch.autograd.grad(image_loss, optimized_states_img, create_graph=True)
+                for row in range(len(optimized_states_img)):
+                    optimized_states_img[row] -= lr*grad_optimized_states_img[row]
 
             # with torch.no_grad():
             logits = model.gen_head(optimized_states_img)  # updated states
@@ -664,7 +668,11 @@ def milr(
                 logit_cond = logits[0::2, :]
                 logit_uncond = logits[1::2, :]
                 fused_logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
-                next_token = torch.multinomial(torch.softmax(fused_logits / temperature, dim=-1), num_samples=1)
+                probs = torch.softmax(fused_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                log_pi = torch.log(probs[0, next_token] + 1e-10)
+                if i == last_iter:
+                    image_log_pi += log_pi
                 generated_tokens[:, j] = next_token.squeeze(dim=-1)
                 next_token = next_token.repeat(1, 2).view(-1)
                 next_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1)
@@ -708,10 +716,9 @@ def milr(
         return new_img, reward_history, total_img+total, image_token_num+len(generated_seq), img_update_length+update_length, model, text_log_pi, image_log_pi
 
 def meta_milr(**kwargs):
-    optimizer_model = torch.optim.Adam(kwargs["model"].parameters(), lr=kwargs["lr"])
-    for it in range(kwargs["train_iterations"]):
-        optimizer_model.zero_grad()
-        new_img, reward_history, TOTAL, TOTAL_TOKEN_LENGTH, TOTAL_UPDATE_LENGTH, model, text_log_pi, image_log_pi = milr(**kwargs)
-        loss = -reward_history[-1]*(text_log_pi.sum()+image_log_pi.sum())
-        loss.backward()
-        optimizer_model.step()
+    optimizer_model = torch.optim.Adam(kwargs["model"].parameters(), lr=kwargs["lr"]) 
+    optimizer_model.zero_grad()
+    new_img, reward_history, TOTAL, TOTAL_TOKEN_LENGTH, TOTAL_UPDATE_LENGTH, model, text_log_pi, image_log_pi = milr(**kwargs)
+    loss = -reward_history[-1]*(text_log_pi+image_log_pi)
+    loss.backward()
+    optimizer_model.step()
