@@ -34,7 +34,7 @@ source /ivi/zfs/s0/original_homes/ydu/miniconda3/bin/activate
 conda activate /ivi/zfs/s0/original_homes/ydu/miniconda3/envs/milr_latentseek/
 
 # === start training script ===
-CUDA_VISIBLE_DEVICES=0 python main_janus.py \
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python main_janus.py \
     --dataset "$PATH_TO_DATA" \
     --model_name_or_path "$PATH_TO_MODEL" \
     --output_dir "$output_dir" \
@@ -51,3 +51,8 @@ CUDA_VISIBLE_DEVICES=0 python main_janus.py \
     --reward_threshold "$reward_threshold" \
     --seed "$seed" \
     > "$LOG_FILE" 2>&1 &
+
+RUN_PID=$!
+echo "$RUN_PID" > "$output_dir/run.pid"
+echo "Started WISE spatio-temporal run with PID $RUN_PID"
+echo "Log: $LOG_FILE"
