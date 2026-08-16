@@ -15,6 +15,7 @@ from PIL import Image
 
 from janus.models import MultiModalityCausalLM, VLChatProcessor
 
+### argument parsing function ###
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate the model")
     parser.add_argument("--dataset", type=str, default="prompts/geneval/evaluation_metadata.jsonl", help="Dataset to evaluate")
@@ -48,25 +49,26 @@ def parse_args():
     return parser.parse_args()
 
 
-# evaluate function 
 def main(args):
     if args.seed:
         set_seed(args.seed)
     
-    # set device
+    ### set device ###
     if args.device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
 
-    # load model and tokenizer
+    # load chat processor (can be used to format input into something digestible by model) and tokenizer
     vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(args.model_name_or_path)
 
+    ### load model to cuda ###
     vl_gpt: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, trust_remote_code=True
     )
     vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
 
+    ### initialize reward model ###
     if args.reward_model_type == "geneval":
         from rewards.reward import RewardModel
         reward_model = RewardModel(
@@ -114,7 +116,7 @@ def main(args):
            device="cuda:0",
         )
 
-    # load dataset
+    ### load dataset ###
     dataset = get_dataset(args.dataset,args.task_type,args.data_name)
     print(f"Example: {dataset[0]}")
 
@@ -128,6 +130,7 @@ def main(args):
     model_name = args.model_name_or_path.split("/")[-1]
     data_name = args.data_name
 
+    ### set max update steps and output dir ###
     if args.optimize_mode == "text":
         args.max_text_steps = 30
         output_dir = f"{args.output_dir}/{model_name}-{data_name}-{args.reward_model_type}-{args.optimize_mode}-text_k{args.text_k}-steps{args.max_text_steps}-lr{args.lr}-reward_threshold{args.reward_threshold}"
@@ -138,9 +141,11 @@ def main(args):
         args.max_both_steps = 30
         output_dir = f"{args.output_dir}/{model_name}-{data_name}-{args.reward_model_type}-{args.optimize_mode}-text_k{args.text_k}-image_k{args.image_k}-steps{args.max_both_steps}-lr{args.lr}-reward_threshold{args.reward_threshold}"
 
+    ### dataset slice start and end index ###
     start_data_idx = max(0, args.start_data_idx)
     end_data_idx = min(args.end_data_idx, len(dataset))
-  
+
+    ### resume run from checkpoint ###
     if args.resume:
         print(f"Resume from {output_dir}")
         # load logistics
@@ -159,6 +164,7 @@ def main(args):
 
     data_idx_list = range(start_data_idx, end_data_idx)
     for i in tqdm(data_idx_list):
+        ### pick one datapoint ###
         example = dataset[i]
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -171,6 +177,7 @@ def main(args):
         if prompt is None:
             continue
 
+        ### First run original generation once on the datapoint ###
         img, text_hidden_states_list, text_final_input_ids, image_hidden_states_list, image_prompt_embed, ori_image_prompt = original_generation(
                 input_text=prompt,
                 model=vl_gpt,

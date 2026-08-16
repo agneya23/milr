@@ -99,19 +99,24 @@ def original_generation(
     inputs = tokenizer(
         [sft_prompt], return_tensors="pt", padding=True, padding_side="right", add_special_tokens=True
     )
-    current_input_ids = inputs.input_ids.to(device)
+    current_input_ids = inputs.input_ids.to(device) ### Shape: [1, prompt_length]
 
-    text_hidden_states_list = []
-    generated_text_ids = []
+    text_hidden_states_list = [] ### contains the last layer hidden states of the generated text by the model ###
+    generated_text_ids = [] ### contains newly generated text tokens by the lm_head
 
+    ### model.language_model.model -> for autoregressive hidden state generation ###
+    ### model.language_model.lm_head -> for mapping hidden state to text token ###
+    ### model.gen_head -> for mapping hidden state to image token ###
+
+    ### Autoregressive text generation
     for _ in range(max_text_tokens):
         # generate normal outputs
         with torch.no_grad():
             outputs = model.language_model.model(current_input_ids, output_hidden_states=True)
-        last_hidden_state = outputs[0][:, -1]  # [B, hidden_dim]
+        last_hidden_state = outputs[0][:, -1]  ### [B, sequence_length, hidden_dim] -> Gets the last layer hidden state of the newly generated text token (although not a token just yet...)
         text_hidden_states_list.append(last_hidden_state.clone())
         # detach + requires_grad
-        last_hidden_state = last_hidden_state.detach()
+        last_hidden_state = last_hidden_state.detach() ### Separate from computational graph coz we dont want the gradients flowing back during latent updates
         last_hidden_state.requires_grad = True
         if last_hidden_state.grad is not None:
             last_hidden_state.grad.zero_()
@@ -128,8 +133,8 @@ def original_generation(
             current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=-1)
 
     # final answer
-    text_final_input_ids = current_input_ids.clone().clone().cpu()
-    enhanced_text = tokenizer.decode(generated_text_ids, skip_special_tokens=True)
+    text_final_input_ids = current_input_ids.clone().clone().cpu() ### The whole text: cot prompt + generated text
+    enhanced_text = tokenizer.decode(generated_text_ids, skip_special_tokens=True) ### Just the enhanced text
     print(enhanced_text)
 
     # ========================================================================
@@ -152,18 +157,23 @@ def original_generation(
     image_prompt_ids = prompt_inputs["input_ids"].to(device)
     attention_mask = prompt_inputs["attention_mask"].to(device)
 
-    image_start_token_id = tokenizer.encode(vl_chat_processor.image_start_tag)[1]
-    image_prompt_ids = torch.cat([image_prompt_ids, image_prompt_ids.new_full((image_prompt_ids.size(0), 1), image_start_token_id)], dim=1)
+    image_start_token_id = tokenizer.encode(vl_chat_processor.image_start_tag)[1] ### Get tokenized representation of just the image start token
+    image_prompt_ids = torch.cat([
+        image_prompt_ids, 
+        image_prompt_ids.new_full((image_prompt_ids.size(0), 1), image_start_token_id) ### create a tensor of shape [B, 1] filled with image start tag token only and concat with the prompt ids. This appends image start tag token to all points in the batch.
+        ], 
+        dim=1)
     attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.size(0), 1))], dim=1)
 
+    ### Guess: parallel_size probably controls the number of sampled images for each prompt. it prolly isnt the actual batch size of multiple prompts
     image_prompt_ids = image_prompt_ids.repeat(parallel_size, 1)
     attention_mask = attention_mask.repeat(parallel_size, 1)
 
-    cond_inputs_embeds = model.language_model.get_input_embeddings()(image_prompt_ids)
+    cond_inputs_embeds = model.language_model.get_input_embeddings()(image_prompt_ids) ### I think this method is to get the embeddings for text tokens specifically...at line 115 in this file, ids are passed and in the foward of the corresponding model the embedding model corresponding to get_input_embeddings is specifically called...there is a different method to get embeddings for image tokens...
     pad_input_embeds = model.language_model.get_input_embeddings()(image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id))
 
     uncond_inputs_embeds = cond_inputs_embeds.clone()
-    uncond_inputs_embeds[:,1:-1] = pad_input_embeds
+    uncond_inputs_embeds[:,1:-1] = pad_input_embeds ### Pad completely all the tokens to this point (cot prompt+generated text tokens) to perform uncondional image token generation. Logits from unconditional and conditional both are then used to get final logits... [:, 1:-1] -> : selects all along the batch dimension, 1:-1 selects all the cot+text tokens except for the start image token...
 
     inputs_embeds_img = torch.repeat_interleave(cond_inputs_embeds, 2, dim=0)
     inputs_embeds_img[1::2] = uncond_inputs_embeds
@@ -187,7 +197,7 @@ def original_generation(
             past_key_values = outputs.past_key_values
             hidden_states = outputs.last_hidden_state
             
-            image_hidden_states_list.append(hidden_states[:, -1, :].clone().cpu())
+            image_hidden_states_list.append(hidden_states[:, -1, :].clone().cpu()) ### [parallel_size, last_time_step_one, dim]
             
             logits = model.gen_head(hidden_states[:, -1, :])
             logit_cond = logits[0::2, :]
@@ -198,7 +208,7 @@ def original_generation(
             next_token = torch.multinomial(probs, num_samples=1)
             generated_image_tokens[:, k] = next_token.squeeze(dim=-1)
             next_token = next_token.repeat(1, 2).view(-1)
-            current_img_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1)
+            current_img_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1) ### Method to specifically get image token embeddings...seems different embedding models used for the two modalities but same autoregressive model to process both to get next tokens...
             attention_mask_img = torch.cat([attention_mask_img, attention_mask_img.new_ones((attention_mask_img.size(0), 1), dtype=torch.int)], dim=1)
 
     with torch.no_grad():

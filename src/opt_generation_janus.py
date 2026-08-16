@@ -515,7 +515,7 @@ def optimized_generation(
         original_seq = []
         original_seq.extend(
             text_final_input_ids[0][len(base_input_ids[-1]) : len(base_input_ids[-1]) + start_index]
-        )
+        ) ### select the first start_index generated text tokens (excluding the cot prompt). start_index helps offset the generated text tokens selected in case wanna explore beyond just the prefix...
         optimized_states = torch.nn.Parameter(
             torch.stack(
                 [
@@ -525,7 +525,7 @@ def optimized_generation(
                     ]
                 ]
             )
-        )
+        ) ### wrap in nn.Parameter the first update_length generated text token hidden states starting from start_index tokens beyond the cot prompt.
         optimizer_text = torch.optim.Adam([optimized_states], lr=lr)
 
         # ========== Step 2: image optimization ==========
@@ -552,10 +552,10 @@ def optimized_generation(
             if current_reward > reward_threshold:
                 break
             optimizer_text.zero_grad()
-
-            logits = model.language_model.lm_head(optimized_states)
+            ### Make a MILR update to the hidden states that were generated from the ori generation
+            logits = model.language_model.lm_head(optimized_states) ### logits shape: [total, V]
             probs = torch.softmax(logits, dim=-1) + 1e-8
-            next_token_ids = torch.argmax(probs, dim=-1).squeeze(-1)
+            next_token_ids = torch.argmax(probs, dim=-1).squeeze(-1) ### get ids of max probable token at each time step
             log_pi = torch.log(
                 probs[torch.arange(update_length), 0, next_token_ids] + 1e-10
             )
@@ -566,6 +566,7 @@ def optimized_generation(
                 torch.nn.utils.clip_grad_norm_([optimized_states], grad_clip)
             optimizer_text.step()
 
+            ### Now that the hidden states of the update_length tokens have been MILR updated, we generate updated token_ids once more and add them to the generated_seq (in this case since it was empty it essentially contains these updated token ids of the generated text from the very beginning of the generated text).
             with torch.no_grad():
                 updated_probs = torch.softmax(model.language_model.lm_head(optimized_states), dim=-1)
                 updated_token_ids = torch.argmax(updated_probs, dim=-1).squeeze(-1)
@@ -576,6 +577,7 @@ def optimized_generation(
                 generated_seq.extend(updated_token_ids.tolist())
 
                 cnt = 0
+                ### Now with the updated tokens, continue autoregressive token generation for text. These newly generated tokens might now change, now that the MILR update was applied...generate the full text token sequence
                 while True:
                     outputs = model.language_model.model(
                         updated_input_ids, output_hidden_states=True
@@ -589,6 +591,7 @@ def optimized_generation(
                     if token_str in stop_words or cnt > max_text_tokens:
                         break
 
+            ### Same process as ori generation
             new_generated_text = tokenizer.decode(generated_seq, skip_special_tokens=True)
             print(f"New Generated Text: {new_generated_text}")
 
@@ -609,9 +612,10 @@ def optimized_generation(
             pad_input_embeds = model.language_model.get_input_embeddings()(image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id))
             uncond_inputs_embeds = cond_inputs_embeds.clone()
             uncond_inputs_embeds[:,1:-1] = pad_input_embeds
-            image_prompt_embed = torch.repeat_interleave(cond_inputs_embeds, 2, dim=0)
+            image_prompt_embed = torch.repeat_interleave(cond_inputs_embeds, 2, dim=0) ### Name a little misleading, image_prompt_embed refers to the embeddings of all the text tokens upto this point which are conditioned on for image generation
             image_prompt_embed[1::2] = uncond_inputs_embeds
 
+            ### MILR Update for image tokens
             optimizer_img.zero_grad()
 
             logits = model.gen_head(optimized_states_img)
@@ -627,6 +631,7 @@ def optimized_generation(
             image_loss.backward()
             optimizer_img.step()
 
+            ### Generate new tokens corresponding to the MILR updated image hidden states
             with torch.no_grad():
                 logits = model.gen_head(optimized_states_img)  # updated states
                 logit_cond = logits[:, 0, :]
@@ -636,15 +641,17 @@ def optimized_generation(
 
                 sampled_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [update_length]
 
+                ### Get the image modality embeddings for these tokens
                 optimized_token_embeds = model.prepare_gen_img_embeds(
                     sampled_token_ids.repeat_interleave(2).view(-1, 2).reshape(-1)
                 ).reshape(img_update_length, 2, -1).permute(1, 0, 2)
-                inputs_embeds_img = torch.cat([image_prompt_embed, optimized_token_embeds], dim=1)
+                inputs_embeds_img = torch.cat([image_prompt_embed, optimized_token_embeds], dim=1) ### concatenate all text embeddings with the image token embeddings of these MILR updated tokens
 
-                generated_tokens = torch.zeros((1, image_token_num), dtype=torch.int).to(device)
-                generated_tokens[:, :img_update_length] = sampled_token_ids
+                generated_tokens = torch.zeros((1, image_token_num), dtype=torch.int).to(device) ### Initialized empty tensor to hold all the to be generated image tokens
+                generated_tokens[:, :img_update_length] = sampled_token_ids ### Fill initial img_update_length with the ones already generated from optimized_states_img
                 current_embeds = inputs_embeds_img
 
+                ### Autoregressive image token generation
                 for j in range(img_update_length, image_token_num):
                     img_outputs = model.language_model.model(
                         inputs_embeds=current_embeds,
@@ -659,7 +666,7 @@ def optimized_generation(
                     next_token = torch.multinomial(torch.softmax(fused_logits / temperature, dim=-1), num_samples=1)
                     generated_tokens[:, j] = next_token.squeeze(dim=-1)
                     next_token = next_token.repeat(1, 2).view(-1)
-                    next_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1)
+                    next_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1) ### Will have to get corresponding image embedding
                     current_embeds = next_embeds
 
                 decoded = model.gen_vision_model.decode_code(
