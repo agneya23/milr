@@ -1,11 +1,12 @@
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-from process import get_dataset,save_image_and_metadata,set_seed
+from process import get_meta_milr_opt_dataset,save_image_and_metadata,set_seed
 from tqdm import tqdm
 
 from ori_generation_janus import original_generation
-from opt_generation_janus import optimized_generation
+from milr.src.opt_meta_milr import meta_milr_optimized_generation
+from meta_milr_optimizer import MetaMilrOptimizer
 
 import argparse
 import numpy as np
@@ -117,8 +118,7 @@ def main(args):
         )
 
     ### load dataset ###
-    dataset = get_dataset(args.dataset,args.task_type,args.data_name)
-    print(f"Example: {dataset[0]}")
+    dataset = get_meta_milr_opt_dataset(args.dataset, args.task_type, args.data_name, args.seed)
 
     original_correct = 0
     optimized_correct = 0
@@ -160,9 +160,14 @@ def main(args):
         fitten_length = logistics["fitten_length"]
 
     
-    print(f"Start to evaluate {data_name} from {start_data_idx} to {end_data_idx}...")
+    print(f"Start to train on {data_name}...")
 
     data_idx_list = range(start_data_idx, end_data_idx)
+
+    meta_milr_optimizer = MetaMilrOptimizer()
+
+    #####   BATCH TRAINING TO BE IMPLEMENTED!!! #####
+    
     for i in tqdm(data_idx_list):
         ### pick one datapoint ###
         example = dataset[i]
@@ -171,9 +176,6 @@ def main(args):
 
         prompt = example["prompt"]
         task_tag = example["tag"]
-
-        print(f"Task_tag: {task_tag}")
-        print(f"prompt: {prompt}")
         if prompt is None:
             continue
 
@@ -189,7 +191,7 @@ def main(args):
             save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
         # print(f"ori_image_prompt:{ori_image_prompt}")
         torch.cuda.empty_cache()
-        new_img, reward_history, ori_total_length, generated_seq, update_length = optimized_generation(
+        new_img, reward_history, ori_total_length, generated_seq, update_length = meta_milr_optimized_generation(
                 reward_model=reward_model,
                 image=img,
                 data=example,
