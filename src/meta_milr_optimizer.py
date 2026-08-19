@@ -5,6 +5,10 @@ class MetaMilrOptimizer(nn.Module):
 
     def __init__(self):
         super().__init__()
+
+        self.p_z = nn.Linear()
+        self.p_g = nn.Linear()
+
         self.token_encoder = nn.Linear()
 
         self.token_score_text = nn.Linear()
@@ -14,7 +18,7 @@ class MetaMilrOptimizer(nn.Module):
         self.h_beta = nn.Linear()
         self.h_alpha = nn.Linear()
 
-    def get_token_feature_vector(self, z_k, g_k, d_k_prev, e_mod, e_pos):
+    def get_token_feature_vector(self, z_k_t, z_k_i, g_k_t, g_k_i, d_k_prev, e_mod, e_pos):
         return x_k
 
     def get_opt_state(self, x_k):
@@ -40,10 +44,10 @@ class MetaMilrOptimizer(nn.Module):
     def get_cont_prob(self):
         pass
 
-    def forward(self, z_k, g_k, d_k_prev):
+    def forward(self, **kwargs):
 
         # Optimizer State Representation
-        x_k = self.get_token_feature_vector(z_k, g_k, d_k_prev)
+        x_k = self.get_token_feature_vector(z_k_t, z_k_i, g_k_t, g_k_i, d_k_prev)
         s_k = self.get_opt_state(x_k)
 
         # Where to Update

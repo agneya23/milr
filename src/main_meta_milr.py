@@ -168,7 +168,7 @@ def main(args):
 
     #####   BATCH TRAINING TO BE IMPLEMENTED!!! #####
     
-    for i in tqdm(data_idx_list):
+    for i in tqdm(data_idx_list): # Proposal Algorithm line 5
         ### pick one datapoint ###
         example = dataset[i]
         if not os.path.exists(output_dir):
@@ -186,11 +186,15 @@ def main(args):
                 vl_chat_processor=vl_chat_processor,
                 optimize_mode = args.optimize_mode,
                 device=device)
+        
         # save original image and metadata
         if img is not None:
             save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
+
         # print(f"ori_image_prompt:{ori_image_prompt}")
+
         torch.cuda.empty_cache()
+        
         new_img, reward_history, ori_total_length, generated_seq, update_length = meta_milr_optimized_generation(
                 reward_model=reward_model,
                 image=img,
