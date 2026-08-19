@@ -205,7 +205,8 @@ def original_generation(
             logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
             
             probs = torch.softmax(logits/temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = torch.argmax(probs, dim=-1)
+            # next_token = torch.multinomial(probs, num_samples=1)
             generated_image_tokens[:, k] = next_token.squeeze(dim=-1)
             next_token = next_token.repeat(1, 2).view(-1)
             current_img_embeds = model.prepare_gen_img_embeds(next_token).unsqueeze(1) ### Method to specifically get image token embeddings...seems different embedding models used for the two modalities but same autoregressive model to process both to get next tokens...

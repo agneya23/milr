@@ -92,6 +92,62 @@ def generate_image_from_prompt(
 
     return image
 
+
+def support_rollout(**kwargs):
+
+    model, text_hidden_states_list, image_hidden_states_list, device, cfg_weight, num_support, temperature, img_size, patch_size, data, reward_model = kwargs["model"], kwargs["text_hidden_states_list"], kwargs["image_hidden_states_list"], kwargs["device"], kwargs["cfg_weight"], kwargs["num_support"], kwargs["temperature"], kwargs["img_size"], kwargs["patch_size"], kwargs["data"], kwargs["reward_model"]
+
+    rewards, text_grads, image_grads = [], [], []
+
+    for s in range(num_support):
+
+        text_hidden_states, image_hidden_states = torch.tensor(text_hidden_states_list).to(device), torch.tensor(image_hidden_states_list).to(device)
+
+        generated_image_tokens = torch.zeros((1, len(image_hidden_states)), dtype=torch.int).to(device)
+
+        text_logits = model.language_model.lm_head(text_hidden_states)
+        text_probs = torch.softmax(text_logits, dim=-1) + 1e-8
+        text_token_ids = torch.argmax(text_probs, dim=-1)
+        text_log_pi = torch.log(text_probs[torch.arange(len(text_hidden_states)), 0, text_token_ids]+1e-10)
+
+        image_logits = model.gen_head(image_hidden_states)
+        image_logits_cond = image_logits[:, 0, :]
+        image_logits_uncond = image_logits[:, 1, :]
+        image_fused_logits = image_logits_uncond+cfg_weight*(image_logits_cond-image_logits_uncond)
+        image_probs = torch.softmax(image_fused_logits/temperature, dim=-1)
+        image_token_ids = torch.multinomial(image_probs, num_samples=1).squeeze(-1)
+        generated_image_tokens[:, :] = image_token_ids
+        image_log_pi = torch.log(image_probs[torch.arange(len(image_hidden_states)), image_token_ids]+1e-10)
+
+        decoded = model.gen_vision_model.decode_code(
+            generated_image_tokens.to(dtype=torch.int), 
+            shape=[1, 8, img_size // patch_size, img_size // patch_size]
+            )
+        decoded = decoded.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
+        decoded = np.clip((decoded + 1) / 2 * 255, 0, 255).astype(np.uint8)
+        new_img = PIL.Image.fromarray(decoded[0])
+
+        reward = reward_model.get_reward(new_img, data)
+        text_loss, image_loss = text_log_pi.sum(), image_log_pi.sum()
+
+        total_loss = text_loss+image_loss
+        inputs_dict = {"text_hidden_states" : text_hidden_states, "image_hidden_states" : image_hidden_states}
+        grads = torch.autograd.grad(total_loss, inputs_dict)
+
+        rewards.append(reward)
+        text_grads.append(grads["text_hidden_states"])
+        image_grads.append(grads["image_hidden_states"])
+
+    avg_reward, std_reward = sum(rewards)/len(rewards), np.std(rewards)
+
+    g_k = torch.zeros_like(text_hidden_states).to(device)
+    for r, tg, ig in zip(rewards, text_grads, image_grads):
+        g_k += ((r-avg_reward)/std_reward) * (tg + ig)
+    g_k /= num_support
+
+    return g_k
+
+
 stop_words = ["</s>", "<|im_end|>", "<|endoftext|>"]
 def meta_milr_optimized_generation(
     reward_model,
@@ -548,7 +604,10 @@ def meta_milr_optimized_generation(
         new_img = None
         generated_seq = []
 
-        for i in range(max_both_steps):
+        for i in range(budget):
+
+            support_rollout(model, base_input_ids)
+
             if current_reward > reward_threshold:
                 break
             optimizer_text.zero_grad()
