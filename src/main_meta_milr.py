@@ -166,10 +166,15 @@ def main(args):
 
     meta_milr_optimizer = MetaMilrOptimizer()
 
+    adamw_optimizer = torch.optim.AdamW(meta_milr_optimizer.parameters(), lr=args.lr)
+
     #####   BATCH TRAINING TO BE IMPLEMENTED!!! #####
     
     for i in tqdm(data_idx_list): # Proposal Algorithm line 5
         ### pick one datapoint ###
+        
+        adamw_optimizer.zero_grad()
+
         example = dataset[i]
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -190,8 +195,6 @@ def main(args):
         # save original image and metadata
         if img is not None:
             save_image_and_metadata(img, example, os.path.join(output_dir, "ori_img"), i, data_name)
-
-        # print(f"ori_image_prompt:{ori_image_prompt}")
 
         torch.cuda.empty_cache()
         
@@ -219,6 +222,7 @@ def main(args):
                 optimize_mode = args.optimize_mode,
                 save_base_path = os.path.join(output_dir, "opt_history", str(i).zfill(4)),
         )
+
         if new_img is not None:
             save_image_and_metadata(new_img, example, os.path.join(output_dir, "opt_img"), i,data_name)
         

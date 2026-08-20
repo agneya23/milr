@@ -209,7 +209,8 @@ def meta_milr_optimized_generation(**kwargs):
         lambda_tok,
         lambda_step,
         lambda_drift,
-        lambda_ent
+        lambda_ent,
+        adamw_optimizer
     ) = (
         kwargs["text_hidden_states_list"],
         kwargs["image_hidden_states_list"],
@@ -222,7 +223,8 @@ def meta_milr_optimized_generation(**kwargs):
         kwargs["lambda_tok"],
         kwargs["lambda_step"],
         kwargs["lambda_drift"],
-        kwargs["lambda_ent"]
+        kwargs["lambda_ent"],
+        kwargs["adamw_optimizer"]
     )
 
     reward_history = []
@@ -234,6 +236,7 @@ def meta_milr_optimized_generation(**kwargs):
     ), torch.tensor(image_hidden_states_list).to(device)
 
     meta_objective = 0
+    C_tok, C_step, C_drift, C_ent = 0, 0, 0, 0
 
     for i in range(budget):  # Proposal Algorithm line 8
 
@@ -246,12 +249,24 @@ def meta_milr_optimized_generation(**kwargs):
         )
 
         # Meta-MILR Optimization
-        text_hidden_states_next, image_hidden_states_next = meta_milr_optimizer(
+        (
+            text_hidden_states_next,
+            image_hidden_states_next,
+            c_tok,
+            c_step,
+            c_drift,
+            c_ent,
+        ) = meta_milr_optimizer(
             z_k_t=text_hidden_states,
             z_k_i=image_hidden_states,
             g_k_t=g_k_t,
             g_k_i=g_k_i,
         )
+
+        C_tok += c_tok
+        C_step += c_step
+        C_drift += c_drift
+        C_ent += c_ent
 
         # Query Rollout
         lk_pg = rollout(
@@ -272,10 +287,6 @@ def meta_milr_optimized_generation(**kwargs):
         - (lambda_ent * C_ent)
     )
 
-    return (
-        new_img,
-        reward_history,
-        total_img + total,
-        image_token_num + len(generated_seq),
-        img_update_length + update_length,
-    )
+    meta_objective.backward()
+    
+    adamw_optimizer.step()
