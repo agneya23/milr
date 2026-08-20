@@ -60,4 +60,7 @@ class MetaMilrOptimizer(nn.Module):
         q_k = self.get_cont_prob()
 
         # Make Update
-        z_k_next = z_k + q_k * del_z_k
+        z_k_t_next = z_k_t + q_k * del_z_k
+        z_k_i_next = z_k_i + q_k * del_z_k
+
+        return z_k_t_next, z_k_i_next
