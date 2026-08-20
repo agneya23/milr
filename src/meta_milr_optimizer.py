@@ -3,22 +3,23 @@ import torch.nn as nn
 
 class MetaMilrOptimizer(nn.Module):
 
-    def __init__(self):
+    def __init__(self, hidden_dim, p_z_dim, p_g_dim, e_k_dim):
         super().__init__()
 
-        self.p_z = nn.Linear()
-        self.p_g = nn.Linear()
+        self.p_z = nn.Linear(hidden_dim, p_z_dim)
+        self.p_g = nn.Linear(hidden_dim, p_g_dim)
 
-        self.token_encoder = nn.Linear()
+        self.token_encoder = nn.Linear((p_z_dim+p_g_dim+5), e_k_dim)
 
-        self.token_score_text = nn.Linear()
+        self.token_score_text = nn.Linear(e_k_dim, 1)
         self.b_phi = nn.Linear()
         self.R_t = [0.05, 0.1, 0.2, 0.4]
 
-        self.h_beta = nn.Linear()
-        self.h_alpha = nn.Linear()
+        self.h_beta = nn.Linear(3*e_k_dim, 1)
+        self.h_alpha = nn.Linear(3*e_k_dim, 1)
 
     def get_token_feature_vector(self, z_k_t, z_k_i, g_k_t, g_k_i, d_k_prev, e_mod, e_pos):
+        
         return x_k
 
     def get_opt_state(self, x_k):

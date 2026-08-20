@@ -89,110 +89,111 @@ def generate_image_from_prompt(
 
 def rollout(**kwargs):
 
-    (
-        model,
-        text_hidden_states,
-        image_hidden_states,
-        device,
-        cfg_weight,
-        num_support,
-        num_query,
-        temperature,
-        img_size,
-        patch_size,
-        data,
-        reward_model,
-        avg_reward,
-        std_reward,
-        mode,
-    ) = (
-        kwargs["model"],
-        kwargs["text_hidden_states"],
-        kwargs["image_hidden_states"],
-        kwargs["device"],
-        kwargs["cfg_weight"],
-        kwargs["num_support"],
-        kwargs["num_query"],
-        kwargs["temperature"],
-        kwargs["img_size"],
-        kwargs["patch_size"],
-        kwargs["data"],
-        kwargs["reward_model"],
-        kwargs["avg_reward"],
-        kwargs["std_reward"],
-        kwargs["mode"],
-    )
+    mode = kwargs["mode"]
 
-    num = num_support if mode == "support" else num_query
-    if mode == "support":
-        rewards, text_grads, image_grads = [], [], []
-    else:
-        lk_pg = 0
-
-    for s in range(num):
-
-        generated_image_tokens = torch.zeros(
-            (1, len(image_hidden_states)), dtype=torch.int
-        ).to(device)
-
-        text_logits = model.language_model.lm_head(text_hidden_states)
-        text_probs = torch.softmax(text_logits, dim=-1) + 1e-8
-        text_token_ids = torch.argmax(text_probs, dim=-1)
-        text_log_pi = torch.log(
-            text_probs[torch.arange(len(text_hidden_states)), 0, text_token_ids] + 1e-10
+    with torch.set_grad_enabled(mode == "query"):
+        (
+            model,
+            text_hidden_states,
+            image_hidden_states,
+            device,
+            cfg_weight,
+            num_support,
+            num_query,
+            temperature,
+            img_size,
+            patch_size,
+            data,
+            reward_model,
+            avg_reward,
+            std_reward,
+        ) = (
+            kwargs["model"],
+            kwargs["text_hidden_states"],
+            kwargs["image_hidden_states"],
+            kwargs["device"],
+            kwargs["cfg_weight"],
+            kwargs["num_support"],
+            kwargs["num_query"],
+            kwargs["temperature"],
+            kwargs["img_size"],
+            kwargs["patch_size"],
+            kwargs["data"],
+            kwargs["reward_model"],
+            kwargs["avg_reward"],
+            kwargs["std_reward"],
         )
 
-        image_logits = model.gen_head(image_hidden_states)
-        image_logits_cond = image_logits[:, 0, :]
-        image_logits_uncond = image_logits[:, 1, :]
-        image_fused_logits = image_logits_uncond + cfg_weight * (
-            image_logits_cond - image_logits_uncond
-        )
-        image_probs = torch.softmax(image_fused_logits / temperature, dim=-1)
-        image_token_ids = torch.multinomial(image_probs, num_samples=1).squeeze(-1)
-        generated_image_tokens[:, :] = image_token_ids
-        image_log_pi = torch.log(
-            image_probs[torch.arange(len(image_hidden_states)), image_token_ids] + 1e-10
-        )
+        num = num_support if mode == "support" else num_query
+        if mode == "support":
+            rewards, text_grads, image_grads = [], [], []
+        else:
+            lk_pg = 0
 
-        decoded = model.gen_vision_model.decode_code(
-            generated_image_tokens.to(dtype=torch.int),
-            shape=[1, 8, img_size // patch_size, img_size // patch_size],
-        )
-        decoded = decoded.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
-        decoded = np.clip((decoded + 1) / 2 * 255, 0, 255).astype(np.uint8)
-        new_img = PIL.Image.fromarray(decoded[0])
+        for s in range(num):
 
-        reward = reward_model.get_reward(new_img, data)
-        text_loss, image_loss = text_log_pi.sum(), image_log_pi.sum()
-        total_loss = text_loss + image_loss
+            generated_image_tokens = torch.zeros(
+                (1, len(image_hidden_states)), dtype=torch.int
+            ).to(device)
+
+            text_logits = model.language_model.lm_head(text_hidden_states)
+            text_probs = torch.softmax(text_logits, dim=-1) + 1e-8
+            text_token_ids = torch.argmax(text_probs, dim=-1)
+            text_log_pi = torch.log(
+                text_probs[torch.arange(len(text_hidden_states)), 0, text_token_ids] + 1e-10
+            )
+
+            image_logits = model.gen_head(image_hidden_states)
+            image_logits_cond = image_logits[:, 0, :]
+            image_logits_uncond = image_logits[:, 1, :]
+            image_fused_logits = image_logits_uncond + cfg_weight * (
+                image_logits_cond - image_logits_uncond
+            )
+            image_probs = torch.softmax(image_fused_logits / temperature, dim=-1)
+            image_token_ids = torch.multinomial(image_probs, num_samples=1).squeeze(-1)
+            generated_image_tokens[:, :] = image_token_ids
+            image_log_pi = torch.log(
+                image_probs[torch.arange(len(image_hidden_states)), image_token_ids] + 1e-10
+            )
+
+            decoded = model.gen_vision_model.decode_code(
+                generated_image_tokens.to(dtype=torch.int),
+                shape=[1, 8, img_size // patch_size, img_size // patch_size],
+            )
+            decoded = decoded.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
+            decoded = np.clip((decoded + 1) / 2 * 255, 0, 255).astype(np.uint8)
+            new_img = PIL.Image.fromarray(decoded[0])
+
+            reward = reward_model.get_reward(new_img, data)
+            text_loss, image_loss = text_log_pi.sum(), image_log_pi.sum()
+            total_loss = text_loss + image_loss
+
+            if mode == "support":
+                inputs_dict = {
+                    "text_hidden_states": text_hidden_states,
+                    "image_hidden_states": image_hidden_states,
+                }
+                grads = torch.autograd.grad(total_loss, inputs_dict)
+
+                rewards.append(reward)
+                text_grads.append(grads["text_hidden_states"])
+                image_grads.append(grads["image_hidden_states"])
+            else:
+                advantage = (reward - avg_reward) / std_reward + 1e-8
+                lk_pg -= advantage.detach() * total_loss
 
         if mode == "support":
-            inputs_dict = {
-                "text_hidden_states": text_hidden_states,
-                "image_hidden_states": image_hidden_states,
-            }
-            grads = torch.autograd.grad(total_loss, inputs_dict)
+            avg_reward, std_reward = sum(rewards) / len(rewards), np.std(rewards)
 
-            rewards.append(reward)
-            text_grads.append(grads["text_hidden_states"])
-            image_grads.append(grads["image_hidden_states"])
-        else:
-            advantage = (reward - avg_reward) / std_reward + 1e-8
-            lk_pg -= advantage.detach() * total_loss
+            g_k_t = torch.zeros_like(text_hidden_states).to(device)
+            g_k_i = torch.zeros_like(image_hidden_states).to(device)
+            for r, tg, ig in zip(rewards, text_grads, image_grads):
+                g_k_t += ((r - avg_reward) / std_reward + 1e-8) * tg
+                g_k_i += ((r - avg_reward) / std_reward + 1e-8) * ig
+            g_k_t /= num_support  # []
+            g_k_i /= num_support  # []
 
-    if mode == "support":
-        avg_reward, std_reward = sum(rewards) / len(rewards), np.std(rewards)
-
-        g_k_t = torch.zeros_like(text_hidden_states).to(device)
-        g_k_i = torch.zeros_like(image_hidden_states).to(device)
-        for r, tg, ig in zip(rewards, text_grads, image_grads):
-            g_k_t += ((r - avg_reward) / std_reward + 1e-8) * tg
-            g_k_i += ((r - avg_reward) / std_reward + 1e-8) * ig
-        g_k_t /= num_support  # []
-        g_k_i /= num_support  # []
-
-    return (g_k_t, g_k_i, avg_reward, std_reward) if mode == "support" else lk_pg
+        return (g_k_t, g_k_i, avg_reward, std_reward) if mode == "support" else lk_pg
 
 
 def meta_milr_optimized_generation(**kwargs):
@@ -259,8 +260,8 @@ def meta_milr_optimized_generation(**kwargs):
         ) = meta_milr_optimizer(
             z_k_t=text_hidden_states,
             z_k_i=image_hidden_states,
-            g_k_t=g_k_t,
-            g_k_i=g_k_i,
+            g_k_t=g_k_t.detach(),
+            g_k_i=g_k_i.detach(),
         )
 
         C_tok += c_tok

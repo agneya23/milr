@@ -258,7 +258,7 @@ def main(args):
 
     data_idx_list = range(start_data_idx, end_data_idx)
 
-    meta_milr_optimizer = MetaMilrOptimizer()
+    meta_milr_optimizer = MetaMilrOptimizer(args.hidden_dim, args.p_z_dim, args.p_g_dim, args.e_k_dim)
 
     adamw_optimizer = torch.optim.AdamW(meta_milr_optimizer.parameters(), lr=args.lr)
 
