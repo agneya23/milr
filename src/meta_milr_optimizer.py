@@ -21,6 +21,7 @@ class MetaMilrOptimizer(nn.Module):
 
         self.h_beta = nn.Linear(3 * e_k_dim, 1)
         self.h_alpha = nn.Linear(3 * e_k_dim, 1)
+        self.alpha_t_max, self.alpha_i_max = 10, 10
 
     def get_token_feature_vector(
         self, z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos
@@ -44,7 +45,7 @@ class MetaMilrOptimizer(nn.Module):
         e_k_i = e_k[num_text:, :]
         e_k_i_pool = torch.mean(e_k_i, 0)
         s_k = torch.cat((e_k_t_pool, e_k_i_pool), -1)
-        return s_k, e_k_t, e_k_i
+        return s_k, e_k_t, e_k_i, e_k
 
     def get_text_window(self, num_text, e_k_t):
         A_rho = [i for i in range(0, num_text, self.step)]
@@ -103,25 +104,54 @@ class MetaMilrOptimizer(nn.Module):
         m_k = torch.cat((m_t_k, m_v_k), 0)
         return m_k
 
-    def get_learned_update(self):
-        pass
+    def get_learned_update(self, g_k_t, g_k_i, m_k, e_k, s_k, num_text, num_image, d_k_t_prev, d_k_i_prev):
+        alpha_max = torch.tensor(
+            [self.alpha_t_max] * num_text + [self.alpha_i_max] * num_image
+        ).to(g_k_t.device)
+        d_k_prev = torch.cat((d_k_t_prev, d_k_i_prev), 0)
+        g_k = torch.cat((g_k_t, g_k_i), 0)
+        g_k_rms = torch.sqrt(torch.sum(g_k**2, -1))
+        g_k_norm = g_k / (g_k_rms.unsqueeze(-1) + 1e-8)
+        beta_k = torch.sigmoid(
+            self.h_beta(torch.cat((e_k, s_k.unsqueeze(0).repeat(e_k.shape[0], 1)), -1))
+        )
+        alpha_k = alpha_max * torch.sigmoid(
+            self.h_alpha(torch.cat((e_k, s_k.unsqueeze(0).repeat(e_k.shape[0], 1)), -1))
+        )
+        d_k = beta_k * d_k_prev + (1 - beta_k) * g_k_norm
+        del_z_k = m_k.unsqueeze(-1) * alpha_k.unsqueeze(-1) * d_k ### add torch.clamp to limit the update range
+        d_k_t, d_k_i = torch.split(d_k, [num_text, num_image], 0)
+        return d_k_t, d_k_i, del_z_k
 
     def get_cont_prob(self):
         pass
 
     def forward(self, **kwargs):
 
+        z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos = (
+            kwargs["z_k_t"],
+            kwargs["z_k_i"],
+            kwargs["g_k_t"],
+            kwargs["g_k_i"],
+            kwargs["d_k_t_prev"],
+            kwargs["d_k_i_prev"],
+            kwargs["e_mod"],
+            kwargs["e_pos"],
+        )
+
         # Optimizer State Representation
         x_k, num_text, num_image = self.get_token_feature_vector(
             z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos
         )
-        s_k, e_k_t, e_k_i = self.get_opt_state(x_k, num_text)
+        s_k, e_k_t, e_k_i, e_k = self.get_opt_state(x_k, num_text)
 
         # Where to Update
         m_k = self.get_binary_mask(num_text, num_image, e_k_t, e_k_i)
 
         # How to Update
-        d_k, del_z_k = self.get_learned_update()
+        d_k_t, d_k_i, del_z_k = self.get_learned_update(
+            g_k_t, g_k_i, m_k, e_k, s_k, num_text, num_image, d_k_t_prev, d_k_i_prev
+        )
 
         # When to Update
         q_k = self.get_cont_prob()
@@ -130,4 +160,4 @@ class MetaMilrOptimizer(nn.Module):
         z_k_t_next = z_k_t + q_k * del_z_k
         z_k_i_next = z_k_i + q_k * del_z_k
 
-        return z_k_t_next, z_k_i_next
+        return z_k_t_next, z_k_i_next, d_k_t, d_k_i
