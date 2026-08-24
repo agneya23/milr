@@ -1,166 +1,330 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MetaMilrOptimizer(nn.Module):
-
-    def __init__(self, hidden_dim, p_z_dim, p_g_dim, e_k_dim):
+    def __init__(
+        self,
+        hidden_dim,
+        p_z_dim,
+        p_g_dim,
+        e_k_dim,
+        routing_temperature=1.0,
+        text_alpha_max=10.0,
+        image_alpha_max=10.0,
+        text_trust_radius=1.0,
+        image_trust_radius=1.0,
+        image_token_cost=1.0,
+    ):
         super().__init__()
 
         self.p_z = nn.Linear(hidden_dim, p_z_dim)
         self.p_g = nn.Linear(hidden_dim, p_g_dim)
+        self.modality_embedding = nn.Embedding(2, 4)
 
-        self.token_encoder = nn.Linear((p_z_dim + p_g_dim + 4), e_k_dim)
+        # log-norm, cosine, entropy, position, k/B, reward, delta reward,
+        # and remaining budget are the eight scalar token features.
+        token_feature_dim = p_z_dim + p_g_dim + 4 + 8
+        self.token_encoder = nn.Sequential(
+            nn.Linear(token_feature_dim, e_k_dim),
+            nn.Tanh(),
+        )
+        self.global_encoder = nn.Sequential(
+            nn.Linear(2 * e_k_dim + 3, 2 * e_k_dim),
+            nn.Tanh(),
+        )
 
         self.token_score_text = nn.Linear(e_k_dim, 1)
         self.token_score_image = nn.Linear(e_k_dim, 1)
-        self.step = 10
-        self.b_phi = nn.Linear()
-        self.R_t = [0.05, 0.1, 0.2, 0.4]
-        self.R_v = [0.005, 0.01, 0.02, 0.04, 0.008]
+        self.text_window_bias = nn.Linear(2 * e_k_dim + 1, 1)
+        self.image_prefix_bias = nn.Linear(2 * e_k_dim + 1, 1)
 
         self.h_beta = nn.Linear(3 * e_k_dim, 1)
         self.h_alpha = nn.Linear(3 * e_k_dim, 1)
-        self.alpha_t_max, self.alpha_i_max = 10, 10
-
         self.h_q = nn.Linear(2 * e_k_dim, 1)
 
-    def get_token_feature_vector(
-        self, z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos
+        self.text_window_ratios = (0.05, 0.10, 0.20, 0.40)
+        self.image_prefix_ratios = (0.005, 0.01, 0.02, 0.04, 0.08)
+        self.text_window_stride = 10
+        self.routing_temperature = routing_temperature
+        self.text_alpha_max = text_alpha_max
+        self.image_alpha_max = image_alpha_max
+        self.text_trust_radius = text_trust_radius
+        self.image_trust_radius = image_trust_radius
+        self.image_token_cost = image_token_cost
+
+    @staticmethod
+    def _token_view(states):
+        # Image latents contain conditional and unconditional CFG branches.
+        return states.mean(dim=1) if states.ndim == 3 else states
+
+    def _token_features(
+        self,
+        z_k_t,
+        z_k_i,
+        g_k_t,
+        g_k_i,
+        d_k_t_prev,
+        d_k_i_prev,
+        text_entropy,
+        image_entropy,
+        step_index,
+        budget,
+        reward_value,
+        reward_delta,
     ):
-        num_text = z_k_t.shape[0]
-        num_image = z_k_i.shape[0]
-        z_k = torch.cat((z_k_t, z_k_i), 0)
-        z_k_low = self.p_z(z_k)
-        g_k = torch.cat((g_k_t, g_k_i), 0)
-        g_k_low = self.p_g(g_k)
-        g_k_norm = torch.sqrt(torch.sum(g_k**2, -1))
-        d_k = torch.cat((d_k_t_prev, d_k_i_prev), 0)
-        cos_g_d = torch.sum(g_k * d_k, -1)
-        x_k = torch.cat((z_k_low, g_k_low, g_k_norm, cos_g_d, e_mod, e_pos), -1)
+        dtype = self.p_z.weight.dtype
+        device = z_k_t.device
+
+        z_t = self._token_view(z_k_t).to(dtype)
+        z_i = self._token_view(z_k_i).to(dtype)
+        g_t = self._token_view(g_k_t).to(dtype)
+        g_i = self._token_view(g_k_i).to(dtype)
+        d_t = self._token_view(d_k_t_prev).to(dtype)
+        d_i = self._token_view(d_k_i_prev).to(dtype)
+
+        z_k = torch.cat((z_t, z_i), dim=0)
+        g_k = torch.cat((g_t, g_i), dim=0)
+        d_k = torch.cat((d_t, d_i), dim=0)
+        num_text = z_t.shape[0]
+        num_image = z_i.shape[0]
+
+        z_low = self.p_z(F.layer_norm(z_k, (z_k.shape[-1],)))
+        g_low = self.p_g(F.layer_norm(g_k, (g_k.shape[-1],)))
+        log_g_norm = torch.log(torch.linalg.vector_norm(g_k, dim=-1) + 1e-8)
+        cosine = F.cosine_similarity(g_k, d_k, dim=-1, eps=1e-8)
+
+        entropy = torch.cat((text_entropy, image_entropy), dim=0).to(
+            device=device, dtype=dtype
+        )
+        text_position = torch.linspace(0.0, 1.0, max(num_text, 1), device=device)[:num_text]
+        image_position = torch.linspace(0.0, 1.0, max(num_image, 1), device=device)[:num_image]
+        position = torch.cat((text_position, image_position), dim=0).to(dtype)
+
+        modality_ids = torch.cat(
+            (
+                torch.zeros(num_text, dtype=torch.long, device=device),
+                torch.ones(num_image, dtype=torch.long, device=device),
+            )
+        )
+        modality = self.modality_embedding(modality_ids)
+
+        token_count = num_text + num_image
+        step_fraction = float(step_index) / max(float(budget), 1.0)
+        remaining_fraction = float(budget - step_index) / max(float(budget), 1.0)
+        shared = z_low.new_tensor(
+            [step_fraction, reward_value, reward_delta, remaining_fraction]
+        ).view(1, 4)
+        shared = shared.expand(token_count, -1)
+
+        x_k = torch.cat(
+            (
+                z_low,
+                g_low,
+                log_g_norm.unsqueeze(-1),
+                cosine.unsqueeze(-1),
+                entropy.unsqueeze(-1),
+                position.unsqueeze(-1),
+                modality,
+                shared,
+            ),
+            dim=-1,
+        )
         return x_k, num_text, num_image
 
-    def get_opt_state(self, x_k, num_text):
+    def _optimizer_state(
+        self, x_k, num_text, reward_value, reward_delta, step_index, budget
+    ):
         e_k = self.token_encoder(x_k)
-        e_k_t = e_k[:num_text, :]
-        e_k_t_pool = torch.mean(e_k_t, 0)
-        e_k_i = e_k[num_text:, :]
-        e_k_i_pool = torch.mean(e_k_i, 0)
-        s_k = torch.cat((e_k_t_pool, e_k_i_pool), -1)
-        return s_k, e_k_t, e_k_i, e_k
+        e_k_t = e_k[:num_text]
+        e_k_i = e_k[num_text:]
+        text_pool = e_k_t.mean(dim=0)
+        image_pool = e_k_i.mean(dim=0)
+        history = e_k.new_tensor(
+            [reward_value, reward_delta, float(step_index) / max(float(budget), 1.0)]
+        )
+        s_k = self.global_encoder(torch.cat((text_pool, image_pool, history), dim=-1))
+        return s_k, e_k_t, e_k_i
 
-    def get_text_window(self, num_text, e_k_t):
-        A_rho = [i for i in range(0, num_text, self.step)]
-        candidate_set = []
-        for a in A_rho:
-            for rho in self.R_t:
-                candidate_set.append((a, a + int(rho * num_text) - 1))
-        maxx_score = -1e10
-        maxx_window = -1
-        for start, end in candidate_set:
-            if end >= num_text:
-                end = num_text - 1
-            e_k_t_window = e_k_t[start : end + 1, :]
-            token_score_e_k_t_window = self.token_score_text(e_k_t_window)
-            text_window_score = torch.sum(token_score_e_k_t_window) / len(
-                token_score_e_k_t_window
-            )  ### need to add bias self.b_phi
-            maxx_window = (
-                (start, end) if text_window_score > maxx_score else maxx_window
+    def _choose_candidate(self, masks, ratios, token_scores, state, bias_head, deterministic):
+        candidate_masks = torch.stack(masks, dim=0)
+        candidate_ratios = token_scores.new_tensor(ratios).unsqueeze(-1)
+        denominators = candidate_masks.sum(dim=-1).clamp_min(1.0)
+        mean_scores = (candidate_masks * token_scores.unsqueeze(0)).sum(dim=-1)
+        mean_scores = mean_scores / denominators
+        state_features = state.unsqueeze(0).expand(len(masks), -1)
+        scores = mean_scores + bias_head(
+            torch.cat((state_features, candidate_ratios), dim=-1)
+        ).squeeze(-1)
+
+        probabilities = torch.softmax(scores / self.routing_temperature, dim=0)
+        if deterministic:
+            choice = F.one_hot(scores.argmax(), num_classes=len(masks)).to(scores.dtype)
+        else:
+            choice = F.gumbel_softmax(
+                scores, tau=self.routing_temperature, hard=True, dim=0
             )
-            maxx_score = max(maxx_score, text_window_score)
-        if maxx_score < 0:
-            return None
-        binary_mask = torch.zeros(num_text, dtype=torch.int)
-        binary_mask[maxx_window[0] : maxx_window[1] + 1] = 1
-        return binary_mask
+        mask = choice @ candidate_masks
+        entropy = -(probabilities * torch.log(probabilities + 1e-8)).sum()
+        return mask, entropy
 
-    def get_image_prefix(self, num_image, e_k_i):
-        candidate_set = []
-        for rho in self.R_v:
-            candidate_set.append((0, int(rho * num_image) - 1))
-        maxx_score = -1e10
-        maxx_window = -1
-        for start, end in candidate_set:
-            if end >= num_image:
-                end = num_image - 1
-            e_k_i_window = e_k_i[start : end + 1, :]
-            token_score_e_k_i_window = self.token_score_image(e_k_i_window)
-            image_window_score = torch.sum(token_score_e_k_i_window) / len(
-                token_score_e_k_i_window
-            )  ### need to add bias self.b_phi
-            maxx_window = (
-                (start, end) if image_window_score > maxx_score else maxx_window
+    def _text_mask(self, e_k_t, state, deterministic):
+        num_text = e_k_t.shape[0]
+        masks = [e_k_t.new_zeros(num_text)]
+        ratios = [0.0]
+        for ratio in self.text_window_ratios:
+            width = min(num_text, max(1, math.ceil(ratio * num_text)))
+            starts = list(range(0, max(num_text - width + 1, 1), self.text_window_stride))
+            last_start = max(num_text - width, 0)
+            if starts[-1] != last_start:
+                starts.append(last_start)
+            for start in starts:
+                mask = e_k_t.new_zeros(num_text)
+                mask[start : start + width] = 1.0
+                masks.append(mask)
+                ratios.append(ratio)
+        token_scores = self.token_score_text(e_k_t).squeeze(-1)
+        return self._choose_candidate(
+            masks,
+            ratios,
+            token_scores,
+            state,
+            self.text_window_bias,
+            deterministic,
+        )
+
+    def _image_mask(self, e_k_i, state, deterministic):
+        num_image = e_k_i.shape[0]
+        masks = [e_k_i.new_zeros(num_image)]
+        ratios = [0.0]
+        for ratio in self.image_prefix_ratios:
+            width = min(num_image, max(1, math.ceil(ratio * num_image)))
+            mask = e_k_i.new_zeros(num_image)
+            mask[:width] = 1.0
+            masks.append(mask)
+            ratios.append(ratio)
+        token_scores = self.token_score_image(e_k_i).squeeze(-1)
+        return self._choose_candidate(
+            masks,
+            ratios,
+            token_scores,
+            state,
+            self.image_prefix_bias,
+            deterministic,
+        )
+
+    @staticmethod
+    def _normalized_direction(gradient):
+        rms = torch.sqrt(torch.mean(gradient.float() ** 2, dim=-1, keepdim=True) + 1e-8)
+        return gradient.float() / rms
+
+    @staticmethod
+    def _clip_to_radius(update, radius):
+        norm = torch.linalg.vector_norm(update, dim=-1, keepdim=True)
+        scale = torch.clamp(radius / (norm + 1e-8), max=1.0)
+        return update * scale
+
+    def _learned_update(self, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_k_t, e_k_i, state):
+        text_context = torch.cat(
+            (e_k_t, state.unsqueeze(0).expand(e_k_t.shape[0], -1)), dim=-1
+        )
+        image_context = torch.cat(
+            (e_k_i, state.unsqueeze(0).expand(e_k_i.shape[0], -1)), dim=-1
+        )
+
+        beta_t = torch.sigmoid(self.h_beta(text_context))
+        beta_i = torch.sigmoid(self.h_beta(image_context)).unsqueeze(1)
+        alpha_t = self.text_alpha_max * torch.sigmoid(self.h_alpha(text_context))
+        alpha_i = self.image_alpha_max * torch.sigmoid(self.h_alpha(image_context)).unsqueeze(1)
+
+        g_t_normalized = self._normalized_direction(g_k_t)
+        g_i_normalized = self._normalized_direction(g_k_i)
+        d_k_t = beta_t * d_k_t_prev.float() + (1.0 - beta_t) * g_t_normalized
+        d_k_i = beta_i * d_k_i_prev.float() + (1.0 - beta_i) * g_i_normalized
+
+        update_t = self._clip_to_radius(alpha_t * d_k_t, self.text_trust_radius)
+        update_i = self._clip_to_radius(alpha_i * d_k_i, self.image_trust_radius)
+        return d_k_t, d_k_i, update_t, update_i
+
+    def forward(
+        self,
+        z_k_t,
+        z_k_i,
+        g_k_t,
+        g_k_i,
+        d_k_t_prev,
+        d_k_i_prev,
+        text_entropy,
+        image_entropy,
+        step_index,
+        budget,
+        reward_value,
+        reward_delta,
+        optimize_mode="both",
+        deterministic=False,
+    ):
+        x_k, num_text, num_image = self._token_features(
+            z_k_t,
+            z_k_i,
+            g_k_t,
+            g_k_i,
+            d_k_t_prev,
+            d_k_i_prev,
+            text_entropy,
+            image_entropy,
+            step_index,
+            budget,
+            reward_value,
+            reward_delta,
+        )
+        state, e_k_t, e_k_i = self._optimizer_state(
+            x_k, num_text, reward_value, reward_delta, step_index, budget
+        )
+
+        if optimize_mode == "image":
+            text_mask = e_k_t.new_zeros(num_text)
+            text_routing_entropy = e_k_t.new_zeros(())
+        else:
+            text_mask, text_routing_entropy = self._text_mask(
+                e_k_t, state, deterministic
             )
-            maxx_score = max(maxx_score, image_window_score)
-        if maxx_score < 0:
-            return None
-        binary_mask = torch.zeros(num_image, dtype=torch.int)
-        binary_mask[maxx_window[0] : maxx_window[1] + 1] = 1
-        return binary_mask
+        if optimize_mode == "text":
+            image_mask = e_k_i.new_zeros(num_image)
+            image_routing_entropy = e_k_i.new_zeros(())
+        else:
+            image_mask, image_routing_entropy = self._image_mask(
+                e_k_i, state, deterministic
+            )
 
-    def get_binary_mask(self, num_text, num_image, e_k_t, e_k_i):
-        m_t_k, m_v_k = self.get_text_window(num_text, e_k_t), self.get_image_prefix(
-            num_image, e_k_i
+        d_k_t, d_k_i, update_t, update_i = self._learned_update(
+            g_k_t,
+            g_k_i,
+            d_k_t_prev,
+            d_k_i_prev,
+            e_k_t,
+            e_k_i,
+            state,
         )
-        m_k = torch.cat((m_t_k, m_v_k), 0)
-        return m_k
+        update_t = text_mask.unsqueeze(-1) * update_t
+        update_i = image_mask.view(-1, 1, 1) * update_i
 
-    def get_learned_update(self, g_k_t, g_k_i, m_k, e_k, s_k, num_text, num_image, d_k_t_prev, d_k_i_prev):
-        alpha_max = torch.tensor(
-            [self.alpha_t_max] * num_text + [self.alpha_i_max] * num_image
-        ).to(g_k_t.device)
-        d_k_prev = torch.cat((d_k_t_prev, d_k_i_prev), 0)
-        g_k = torch.cat((g_k_t, g_k_i), 0)
-        g_k_rms = torch.sqrt(torch.sum(g_k**2, -1))
-        g_k_norm = g_k / (g_k_rms.unsqueeze(-1) + 1e-8)
-        beta_k = torch.sigmoid(
-            self.h_beta(torch.cat((e_k, s_k.unsqueeze(0).repeat(e_k.shape[0], 1)), -1))
+        continuation = torch.sigmoid(self.h_q(state)).squeeze()
+        z_k_t_next = z_k_t + (continuation * update_t).to(z_k_t.dtype)
+        z_k_i_next = z_k_i + (continuation * update_i).to(z_k_i.dtype)
+
+        token_cost = continuation * (
+            text_mask.sum() / max(num_text, 1)
+            + self.image_token_cost * image_mask.sum() / max(num_image, 1)
         )
-        alpha_k = alpha_max * torch.sigmoid(
-            self.h_alpha(torch.cat((e_k, s_k.unsqueeze(0).repeat(e_k.shape[0], 1)), -1))
-        )
-        d_k = beta_k * d_k_prev + (1 - beta_k) * g_k_norm
-        del_z_k = m_k.unsqueeze(-1) * alpha_k.unsqueeze(-1) * d_k ### add torch.clamp to limit the update range
-        d_k_t, d_k_i = torch.split(d_k, [num_text, num_image], 0)
-        return d_k_t, d_k_i, del_z_k
-
-    def get_cont_prob(self):
-        q_k = torch.sigmoid(self.h_q(torch.cat((self.s_k), -1)))
-        return q_k
-
-    def forward(self, **kwargs):
-
-        z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos = (
-            kwargs["z_k_t"],
-            kwargs["z_k_i"],
-            kwargs["g_k_t"],
-            kwargs["g_k_i"],
-            kwargs["d_k_t_prev"],
-            kwargs["d_k_i_prev"],
-            kwargs["e_mod"],
-            kwargs["e_pos"],
-        )
-
-        # Optimizer State Representation
-        x_k, num_text, num_image = self.get_token_feature_vector(
-            z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos
-        )
-        s_k, e_k_t, e_k_i, e_k = self.get_opt_state(x_k, num_text)
-
-        # Where to Update
-        m_k = self.get_binary_mask(num_text, num_image, e_k_t, e_k_i)
-
-        # How to Update
-        d_k_t, d_k_i, del_z_k = self.get_learned_update(
-            g_k_t, g_k_i, m_k, e_k, s_k, num_text, num_image, d_k_t_prev, d_k_i_prev
-        )
-
-        # When to Update
-        q_k = self.get_cont_prob()
-
-        # Make Update
-        z_k_t_next = z_k_t + q_k * del_z_k
-        z_k_i_next = z_k_i + q_k * del_z_k
-
-        return z_k_t_next, z_k_i_next, d_k_t, d_k_i
+        stats = {
+            "token_cost": token_cost,
+            "step_cost": continuation,
+            "routing_entropy": text_routing_entropy + image_routing_entropy,
+            "continuation": continuation,
+            "text_mask": text_mask,
+            "image_mask": image_mask,
+        }
+        return z_k_t_next, z_k_i_next, d_k_t, d_k_i, stats

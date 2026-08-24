@@ -1,293 +1,538 @@
-import os
-import torch
+import math
+
 import numpy as np
 import PIL.Image
+import torch
 
 
-@torch.inference_mode()
-def generate_image_from_prompt(
-    mmgpt,
-    vl_chat_processor,
-    user_prompt: str,
-    temperature: float = 1.0,
-    cfg_weight: float = 5.0,
-    image_token_num: int = 576,
-    img_size: int = 384,
-    patch_size: int = 16,
-    save_path: str = None,
-):
-    print("user_prompt:", user_prompt)
+def _as_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().float().cpu().item())
+    return float(value)
 
-    # === construct chat prompt ===
+
+def _categorical_sample(probabilities, deterministic=False):
+    if deterministic:
+        return probabilities.argmax(dim=-1)
+    return torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+
+
+def _entropy(probabilities):
+    return -(probabilities * torch.log(probabilities + 1e-8)).sum(dim=-1)
+
+
+@torch.no_grad()
+def _image_prompt_embeddings(model, vl_chat_processor, prompt, device):
     conversation = [
-        {"role": "<|User|>", "content": user_prompt},
-        {"role": "<|Assistant|>", "content": ""},
+        {"role": "User", "content": prompt},
+        {"role": "Assistant", "content": ""},
     ]
-    prompt = (
-        vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
-            conversations=conversation,
-            sft_format=vl_chat_processor.sft_format,
-            system_prompt="",
-        )
-        + vl_chat_processor.image_start_tag
+    sft_prompt = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
+        conversations=conversation,
+        sft_format=vl_chat_processor.sft_format,
+        system_prompt="",
+    )
+    prompt_inputs = vl_chat_processor.tokenizer(
+        text=[sft_prompt],
+        return_tensors="pt",
+        padding=True,
+        padding_side="right",
+        add_special_tokens=True,
+    )
+    image_prompt_ids = prompt_inputs["input_ids"].to(device)
+    image_start_ids = vl_chat_processor.tokenizer.encode(
+        vl_chat_processor.image_start_tag, add_special_tokens=False
+    )
+    image_prompt_ids = torch.cat(
+        (
+            image_prompt_ids,
+            image_prompt_ids.new_full((image_prompt_ids.shape[0], 1), image_start_ids[-1]),
+        ),
+        dim=1,
     )
 
-    # === Tokenize ===
-    input_ids = vl_chat_processor.tokenizer.encode(prompt)
-    input_ids = torch.LongTensor(input_ids)
+    embedding_layer = model.language_model.get_input_embeddings()
+    conditional = embedding_layer(image_prompt_ids)
+    pad_ids = image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id)
+    pad_embedding = embedding_layer(pad_ids)
+    unconditional = conditional.clone()
+    unconditional[:, 1:-1] = pad_embedding
+    return torch.cat((conditional, unconditional), dim=0)
 
-    parallel_size = 1  # only generate one image
-    tokens = torch.zeros((parallel_size * 2, len(input_ids)), dtype=torch.int).cuda()
-    for i in range(parallel_size * 2):
-        tokens[i, :] = input_ids
-        if i % 2 != 0:
-            tokens[i, 1:-1] = vl_chat_processor.pad_id  # unconditional
 
-    inputs_embeds = mmgpt.language_model.get_input_embeddings()(tokens)
+@torch.no_grad()
+def _generate_image_suffix(
+    model,
+    prompt_embeddings,
+    prefix_token_ids,
+    device,
+    cfg_weight,
+    temperature,
+    image_token_num,
+    img_size,
+    patch_size,
+    deterministic=False,
+):
+    prefix_length = prefix_token_ids.numel()
     generated_tokens = torch.zeros(
-        (parallel_size, image_token_num), dtype=torch.int
-    ).cuda()
+        (1, image_token_num), dtype=torch.int, device=device
+    )
+
+    if prefix_length:
+        generated_tokens[:, :prefix_length] = prefix_token_ids
+        paired_ids = prefix_token_ids.unsqueeze(-1).expand(-1, 2).reshape(-1)
+        prefix_embeddings = model.prepare_gen_img_embeds(paired_ids)
+        prefix_embeddings = prefix_embeddings.reshape(prefix_length, 2, -1).permute(1, 0, 2)
+        current_embeddings = torch.cat((prompt_embeddings, prefix_embeddings), dim=1)
+    else:
+        current_embeddings = prompt_embeddings
 
     outputs = None
-    for i in range(image_token_num):
-        outputs = mmgpt.language_model.model(
-            inputs_embeds=inputs_embeds,
+    for position in range(prefix_length, image_token_num):
+        outputs = model.language_model.model(
+            inputs_embeds=current_embeddings,
             use_cache=True,
-            past_key_values=outputs.past_key_values if i > 0 else None,
+            past_key_values=outputs.past_key_values if outputs is not None else None,
         )
-        hidden_states = outputs.last_hidden_state  # [2, seq, hidden]
+        hidden_state = outputs.last_hidden_state[:, -1, :]
+        logits = model.gen_head(hidden_state)
+        conditional_logits = logits[0::2]
+        unconditional_logits = logits[1::2]
+        fused_logits = unconditional_logits + cfg_weight * (
+            conditional_logits - unconditional_logits
+        )
+        probabilities = torch.softmax(fused_logits / temperature, dim=-1)
+        next_token = _categorical_sample(probabilities, deterministic=deterministic)
+        generated_tokens[:, position] = next_token
 
-        logits = mmgpt.gen_head(hidden_states[:, -1, :])  # [2, vocab]
-        logit_cond = logits[0::2]
-        logit_uncond = logits[1::2]
-        fused_logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
+        paired_token = next_token.unsqueeze(-1).expand(-1, 2).reshape(-1)
+        current_embeddings = model.prepare_gen_img_embeds(paired_token).unsqueeze(1)
 
-        probs = torch.softmax(fused_logits / temperature, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
-        generated_tokens[:, i] = next_token.squeeze(-1)
-
-        next_token = torch.cat([next_token, next_token], dim=1).view(-1)  # [2]
-        img_embeds = mmgpt.prepare_gen_img_embeds(next_token)
-        inputs_embeds = img_embeds.unsqueeze(1)
-
-    # === image decoding ===
-    decoded = mmgpt.gen_vision_model.decode_code(
-        generated_tokens.to(dtype=torch.int),
-        shape=[parallel_size, 8, img_size // patch_size, img_size // patch_size],
+    decoded = model.gen_vision_model.decode_code(
+        generated_tokens,
+        shape=[1, 8, img_size // patch_size, img_size // patch_size],
     )
-    decoded = decoded.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
-    decoded = np.clip((decoded + 1) / 2 * 255, 0, 255).astype(np.uint8)
-
-    image = PIL.Image.fromarray(decoded[0])
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        image.save(save_path)
-
-    return image
+    decoded = decoded.detach().float().cpu().numpy().transpose(0, 2, 3, 1)
+    decoded = np.clip((decoded + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
+    return PIL.Image.fromarray(decoded[0])
 
 
-def rollout(**kwargs):
+def _sample_generation(
+    model,
+    vl_chat_processor,
+    reward_model,
+    data,
+    text_hidden_states,
+    image_hidden_states,
+    ori_image_prompt,
+    optimize_mode,
+    device,
+    cfg_weight,
+    temperature,
+    image_token_num,
+    img_size,
+    patch_size,
+    deterministic=False,
+):
+    zero = text_hidden_states.sum() * 0.0 + image_hidden_states.sum() * 0.0
+    text_log_probability = zero
+    image_log_probability = zero
+    text_entropy = text_hidden_states.new_zeros(text_hidden_states.shape[0], dtype=torch.float32)
+    image_entropy = image_hidden_states.new_zeros(image_hidden_states.shape[0], dtype=torch.float32)
 
-    mode = kwargs["mode"]
-
-    with torch.set_grad_enabled(mode == "query"):
-        (
-            model,
-            text_hidden_states,
-            image_hidden_states,
-            device,
-            cfg_weight,
-            num_support,
-            num_query,
-            temperature,
-            img_size,
-            patch_size,
-            data,
-            reward_model,
-            avg_reward,
-            std_reward,
-        ) = (
-            kwargs["model"],
-            kwargs["text_hidden_states"],
-            kwargs["image_hidden_states"],
-            kwargs["device"],
-            kwargs["cfg_weight"],
-            kwargs["num_support"],
-            kwargs["num_query"],
-            kwargs["temperature"],
-            kwargs["img_size"],
-            kwargs["patch_size"],
-            kwargs["data"],
-            kwargs["reward_model"],
-            kwargs["avg_reward"],
-            kwargs["std_reward"],
+    if optimize_mode != "image":
+        text_logits = model.language_model.lm_head(text_hidden_states)
+        text_probabilities = torch.softmax(text_logits.float(), dim=-1)
+        text_token_ids = _categorical_sample(
+            text_probabilities, deterministic=deterministic
         )
+        text_log_probability = torch.log(
+            text_probabilities[
+                torch.arange(text_hidden_states.shape[0], device=device), text_token_ids
+            ]
+            + 1e-8
+        ).sum()
+        text_entropy = _entropy(text_probabilities)
+        enhanced_text = vl_chat_processor.tokenizer.decode(
+            text_token_ids.detach().cpu().tolist(), skip_special_tokens=True
+        )
+        image_prompt = f"{data['prompt']}. {enhanced_text}"
+    else:
+        image_prompt = ori_image_prompt
 
-        num = num_support if mode == "support" else num_query
+    prefix_token_ids = torch.empty(0, dtype=torch.long, device=device)
+    if optimize_mode != "text":
+        prefix_length = min(
+            image_hidden_states.shape[0],
+            max(1, math.ceil(0.08 * image_hidden_states.shape[0])),
+        )
+        image_logits = model.gen_head(image_hidden_states[:prefix_length])
+        conditional_logits = image_logits[:, 0, :].float()
+        unconditional_logits = image_logits[:, 1, :].float()
+        fused_logits = unconditional_logits + cfg_weight * (
+            conditional_logits - unconditional_logits
+        )
+        image_probabilities = torch.softmax(fused_logits / temperature, dim=-1)
+        prefix_token_ids = _categorical_sample(
+            image_probabilities, deterministic=deterministic
+        )
+        image_log_probability = torch.log(
+            image_probabilities[
+                torch.arange(prefix_length, device=device), prefix_token_ids
+            ]
+            + 1e-8
+        ).sum()
+        image_entropy[:prefix_length] = _entropy(image_probabilities)
+
+    prompt_embeddings = _image_prompt_embeddings(
+        model, vl_chat_processor, image_prompt, device
+    )
+    image = _generate_image_suffix(
+        model=model,
+        prompt_embeddings=prompt_embeddings,
+        prefix_token_ids=prefix_token_ids.detach(),
+        device=device,
+        cfg_weight=cfg_weight,
+        temperature=temperature,
+        image_token_num=image_token_num,
+        img_size=img_size,
+        patch_size=patch_size,
+        deterministic=deterministic,
+    )
+    reward = _as_float(reward_model.get_reward(image, data))
+    return {
+        "log_probability": text_log_probability + image_log_probability,
+        "reward": reward,
+        "image": image,
+        "text_entropy": text_entropy,
+        "image_entropy": image_entropy,
+    }
+
+
+def rollout(
+    mode,
+    model,
+    vl_chat_processor,
+    reward_model,
+    data,
+    text_hidden_states,
+    image_hidden_states,
+    ori_image_prompt,
+    optimize_mode,
+    device,
+    num_samples,
+    cfg_weight,
+    temperature,
+    image_token_num,
+    img_size,
+    patch_size,
+    initial_reward,
+    reward_baseline,
+    reward_scale=1.0,
+    ema_decay=0.9,
+    deterministic=False,
+):
+    if mode not in ("support", "query"):
+        raise ValueError("mode must be 'support' or 'query'")
+
+    if mode == "support":
+        rollout_text_states = text_hidden_states.detach().requires_grad_(True)
+        rollout_image_states = image_hidden_states.detach().requires_grad_(True)
+    else:
+        rollout_text_states = text_hidden_states
+        rollout_image_states = image_hidden_states
+
+    samples = []
+    with torch.enable_grad():
+        for _ in range(num_samples):
+            samples.append(
+                _sample_generation(
+                    model=model,
+                    vl_chat_processor=vl_chat_processor,
+                    reward_model=reward_model,
+                    data=data,
+                    text_hidden_states=rollout_text_states,
+                    image_hidden_states=rollout_image_states,
+                    ori_image_prompt=ori_image_prompt,
+                    optimize_mode=optimize_mode,
+                    device=device,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    image_token_num=image_token_num,
+                    img_size=img_size,
+                    patch_size=patch_size,
+                    deterministic=deterministic,
+                )
+            )
+
+        rewards = [sample["reward"] for sample in samples]
         if mode == "support":
-            rewards, text_grads, image_grads = [], [], []
-        else:
-            lk_pg = 0
-
-        for s in range(num):
-
-            generated_image_tokens = torch.zeros(
-                (1, len(image_hidden_states)), dtype=torch.int
-            ).to(device)
-
-            text_logits = model.language_model.lm_head(text_hidden_states)
-            text_probs = torch.softmax(text_logits, dim=-1) + 1e-8
-            text_token_ids = torch.argmax(text_probs, dim=-1)
-            text_log_pi = torch.log(
-                text_probs[torch.arange(len(text_hidden_states)), 0, text_token_ids] + 1e-10
-            )
-
-            image_logits = model.gen_head(image_hidden_states)
-            image_logits_cond = image_logits[:, 0, :]
-            image_logits_uncond = image_logits[:, 1, :]
-            image_fused_logits = image_logits_uncond + cfg_weight * (
-                image_logits_cond - image_logits_uncond
-            )
-            image_probs = torch.softmax(image_fused_logits / temperature, dim=-1)
-            image_token_ids = torch.multinomial(image_probs, num_samples=1).squeeze(-1)
-            generated_image_tokens[:, :] = image_token_ids
-            image_log_pi = torch.log(
-                image_probs[torch.arange(len(image_hidden_states)), image_token_ids] + 1e-10
-            )
-
-            decoded = model.gen_vision_model.decode_code(
-                generated_image_tokens.to(dtype=torch.int),
-                shape=[1, 8, img_size // patch_size, img_size // patch_size],
-            )
-            decoded = decoded.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
-            decoded = np.clip((decoded + 1) / 2 * 255, 0, 255).astype(np.uint8)
-            new_img = PIL.Image.fromarray(decoded[0])
-
-            reward = reward_model.get_reward(new_img, data)
-            text_loss, image_loss = text_log_pi.sum(), image_log_pi.sum()
-            total_loss = text_loss + image_loss
-
-            if mode == "support":
-                inputs_dict = {
-                    "text_hidden_states": text_hidden_states,
-                    "image_hidden_states": image_hidden_states,
-                }
-                grads = torch.autograd.grad(total_loss, inputs_dict)
-
-                rewards.append(reward)
-                text_grads.append(grads["text_hidden_states"])
-                image_grads.append(grads["image_hidden_states"])
+            mean_reward = float(np.mean(rewards))
+            observed_std = float(np.std(rewards))
+            if num_samples == 1 or observed_std <= 1e-8:
+                advantages = [reward - reward_baseline for reward in rewards]
+                std_reward = 1.0
+                next_baseline = (
+                    ema_decay * reward_baseline + (1.0 - ema_decay) * mean_reward
+                )
             else:
-                advantage = (reward - avg_reward) / std_reward + 1e-8
-                lk_pg -= advantage.detach() * total_loss
+                std_reward = observed_std
+                denominator = std_reward + 1e-8
+                advantages = [(reward - mean_reward) / denominator for reward in rewards]
+                next_baseline = reward_baseline
 
-        if mode == "support":
-            avg_reward, std_reward = sum(rewards) / len(rewards), np.std(rewards)
+            support_objective = sum(
+                advantage * sample["log_probability"]
+                for advantage, sample in zip(advantages, samples)
+            ) / num_samples
+            text_gradient, image_gradient = torch.autograd.grad(
+                support_objective,
+                (rollout_text_states, rollout_image_states),
+                create_graph=False,
+                allow_unused=True,
+            )
+            if text_gradient is None:
+                text_gradient = torch.zeros_like(rollout_text_states)
+            if image_gradient is None:
+                image_gradient = torch.zeros_like(rollout_image_states)
 
-            g_k_t = torch.zeros_like(text_hidden_states).to(device)
-            g_k_i = torch.zeros_like(image_hidden_states).to(device)
-            for r, tg, ig in zip(rewards, text_grads, image_grads):
-                g_k_t += ((r - avg_reward) / std_reward + 1e-8) * tg
-                g_k_i += ((r - avg_reward) / std_reward + 1e-8) * ig
-            g_k_t /= num_support  # []
-            g_k_i /= num_support  # []
+            return {
+                "text_gradient": text_gradient.detach(),
+                "image_gradient": image_gradient.detach(),
+                "mean_reward": mean_reward,
+                "std_reward": std_reward,
+                "reward_baseline": next_baseline,
+                "text_entropy": samples[0]["text_entropy"].detach(),
+                "image_entropy": samples[0]["image_entropy"].detach(),
+                "samples": samples,
+            }
 
-        return (g_k_t, g_k_i, avg_reward, std_reward) if mode == "support" else lk_pg
+        denominator = max(reward_scale, 1e-8)
+        query_losses = []
+        for sample in samples:
+            reward_improvement = (sample["reward"] - initial_reward) / denominator
+            query_losses.append(
+                -sample["log_probability"] * sample["log_probability"].new_tensor(
+                    reward_improvement
+                )
+            )
+        return {
+            "loss": torch.stack(query_losses).mean(),
+            "mean_reward": float(np.mean(rewards)),
+            "samples": samples,
+        }
 
 
-def meta_milr_optimized_generation(**kwargs):
-
-    (
-        text_hidden_states_list,
-        image_hidden_states_list,
-        device,
-        image,
-        data,
-        reward_model,
-        budget,
-        lambda_auc,
-        lambda_tok,
-        lambda_step,
-        lambda_drift,
-        lambda_ent,
-        adamw_optimizer
-    ) = (
-        kwargs["text_hidden_states_list"],
-        kwargs["image_hidden_states_list"],
-        kwargs["device"],
-        kwargs["image"],
-        kwargs["data"],
-        kwargs["reward_model"],
-        kwargs["budget"],
-        kwargs["lambda_auc"],
-        kwargs["lambda_tok"],
-        kwargs["lambda_step"],
-        kwargs["lambda_drift"],
-        kwargs["lambda_ent"],
-        kwargs["adamw_optimizer"]
+def _latent_drift(text_states, image_states, initial_text_states, initial_image_states):
+    text_drift = (text_states.float() - initial_text_states.float()).pow(2).sum()
+    image_drift = (image_states.float() - initial_image_states.float()).pow(2).sum() / 2.0
+    return (text_drift + image_drift) / max(
+        text_states.shape[0] + image_states.shape[0], 1
     )
 
-    reward_history = []
-    initial_reward = reward_model.get_reward(image, data)
-    reward_history.append(initial_reward)
 
-    text_hidden_states, image_hidden_states = torch.tensor(text_hidden_states_list).to(
-        device
-    ), torch.tensor(image_hidden_states_list).to(device)
+def meta_milr_optimized_generation(
+    *,
+    meta_milr_optimizer,
+    reward_model,
+    image,
+    data,
+    model,
+    vl_chat_processor,
+    device,
+    text_hidden_states_list,
+    image_hidden_states_list,
+    ori_image_prompt,
+    budget=5,
+    num_support=2,
+    num_query=1,
+    lambda_auc=1.0,
+    lambda_tok=0.01,
+    lambda_step=0.01,
+    lambda_drift=0.001,
+    lambda_ent=0.001,
+    cfg_weight=5.0,
+    temperature=1.0,
+    image_token_num=576,
+    img_size=384,
+    patch_size=16,
+    optimize_mode="both",
+    stop_threshold=0.5,
+    train_meta=True,
+    loss_scale=1.0,
+):
+    text_hidden_states = torch.stack(
+        [state.detach().to(device) for state in text_hidden_states_list], dim=0
+    )
+    if text_hidden_states.ndim == 3 and text_hidden_states.shape[1] == 1:
+        text_hidden_states = text_hidden_states[:, 0, :]
+    image_hidden_states = torch.stack(
+        [state.detach().to(device) for state in image_hidden_states_list], dim=0
+    )
 
-    meta_objective = 0
-    C_tok, C_step, C_drift, C_ent = 0, 0, 0, 0
+    initial_text_states = text_hidden_states.detach().clone()
+    initial_image_states = image_hidden_states.detach().clone()
+    text_direction = torch.zeros_like(text_hidden_states, dtype=torch.float32)
+    image_direction = torch.zeros_like(image_hidden_states, dtype=torch.float32)
 
-    for i in range(budget):  # Proposal Algorithm line 8
+    initial_reward = _as_float(reward_model.get_reward(image, data))
+    reward_history = [initial_reward]
+    reward_baseline = initial_reward
+    current_reward = initial_reward
+    previous_reward = initial_reward
+    best_reward = initial_reward
+    best_image = image
 
-        # Support Rollout
-        g_k_t, g_k_i, avg_reward, std_reward = rollout(
-            **kwargs,
+    query_losses = []
+    token_cost = text_hidden_states.new_zeros((), dtype=torch.float32)
+    step_cost = text_hidden_states.new_zeros((), dtype=torch.float32)
+    drift_cost = text_hidden_states.new_zeros((), dtype=torch.float32)
+    routing_entropy = text_hidden_states.new_zeros((), dtype=torch.float32)
+    executed_steps = 0
+
+    for step_index in range(budget):
+        support = rollout(
+            mode="support",
+            model=model,
+            vl_chat_processor=vl_chat_processor,
+            reward_model=reward_model,
+            data=data,
             text_hidden_states=text_hidden_states,
             image_hidden_states=image_hidden_states,
-            mode="support"
+            ori_image_prompt=ori_image_prompt,
+            optimize_mode=optimize_mode,
+            device=device,
+            num_samples=num_support if train_meta else 1,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            image_token_num=image_token_num,
+            img_size=img_size,
+            patch_size=patch_size,
+            initial_reward=initial_reward,
+            reward_baseline=reward_baseline,
+            deterministic=False,
         )
+        reward_baseline = support["reward_baseline"]
+        for sample in support["samples"]:
+            if sample["reward"] > best_reward:
+                best_reward = sample["reward"]
+                best_image = sample["image"]
+        reward_scale = support["std_reward"] if support["std_reward"] > 1e-8 else 1.0
+        reward_feature = (current_reward - support["mean_reward"]) / reward_scale
+        reward_delta = (current_reward - previous_reward) / reward_scale
 
-        # Meta-MILR Optimization
-        (
-            text_hidden_states_next,
-            image_hidden_states_next,
-            c_tok,
-            c_step,
-            c_drift,
-            c_ent,
-        ) = meta_milr_optimizer(
+        optimizer_call = lambda: meta_milr_optimizer(
             z_k_t=text_hidden_states,
             z_k_i=image_hidden_states,
-            g_k_t=g_k_t.detach(),
-            g_k_i=g_k_i.detach(),
+            g_k_t=support["text_gradient"],
+            g_k_i=support["image_gradient"],
+            d_k_t_prev=text_direction,
+            d_k_i_prev=image_direction,
+            text_entropy=support["text_entropy"],
+            image_entropy=support["image_entropy"],
+            step_index=step_index,
+            budget=budget,
+            reward_value=reward_feature,
+            reward_delta=reward_delta,
+            optimize_mode=optimize_mode,
+            deterministic=not train_meta,
+        )
+        if train_meta:
+            (
+                next_text_states,
+                next_image_states,
+                next_text_direction,
+                next_image_direction,
+                optimizer_stats,
+            ) = optimizer_call()
+        else:
+            with torch.no_grad():
+                (
+                    next_text_states,
+                    next_image_states,
+                    next_text_direction,
+                    next_image_direction,
+                    optimizer_stats,
+                ) = optimizer_call()
+
+        continuation = _as_float(optimizer_stats["continuation"])
+        both_masks_are_null = (
+            _as_float(optimizer_stats["text_mask"].sum()) == 0.0
+            and _as_float(optimizer_stats["image_mask"].sum()) == 0.0
+        )
+        if not train_meta and (
+            continuation < stop_threshold or both_masks_are_null
+        ):
+            break
+
+        query = rollout(
+            mode="query",
+            model=model,
+            vl_chat_processor=vl_chat_processor,
+            reward_model=reward_model,
+            data=data,
+            text_hidden_states=next_text_states,
+            image_hidden_states=next_image_states,
+            ori_image_prompt=ori_image_prompt,
+            optimize_mode=optimize_mode,
+            device=device,
+            num_samples=num_query if train_meta else 1,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            image_token_num=image_token_num,
+            img_size=img_size,
+            patch_size=patch_size,
+            initial_reward=initial_reward,
+            reward_baseline=reward_baseline,
+            reward_scale=reward_scale,
+            deterministic=False,
+        )
+        if train_meta:
+            query_losses.append(query["loss"])
+
+        previous_reward = current_reward
+        current_reward = query["mean_reward"]
+        reward_history.append(current_reward)
+        for sample in query["samples"]:
+            if sample["reward"] > best_reward:
+                best_reward = sample["reward"]
+                best_image = sample["image"]
+
+        token_cost = token_cost + optimizer_stats["token_cost"]
+        step_cost = step_cost + optimizer_stats["step_cost"]
+        routing_entropy = routing_entropy + optimizer_stats["routing_entropy"]
+        drift_cost = drift_cost + _latent_drift(
+            next_text_states,
+            next_image_states,
+            initial_text_states,
+            initial_image_states,
         )
 
-        C_tok += c_tok
-        C_step += c_step
-        C_drift += c_drift
-        C_ent += c_ent
+        text_hidden_states = next_text_states
+        image_hidden_states = next_image_states
+        text_direction = next_text_direction
+        image_direction = next_image_direction
+        executed_steps += 1
 
-        # Query Rollout
-        lk_pg = rollout(
-            **kwargs,
-            text_hidden_states=text_hidden_states_next,
-            image_hidden_states=image_hidden_states_next,
-            avg_reward=avg_reward,
-            std_reward=std_reward,
-            mode="query"
+    objective_value = None
+    if train_meta and query_losses:
+        anytime_loss = torch.stack(query_losses).sum() / budget
+        meta_objective = (
+            query_losses[-1]
+            + lambda_auc * anytime_loss
+            + lambda_tok * token_cost
+            + lambda_step * step_cost
+            + lambda_drift * drift_cost
+            - lambda_ent * routing_entropy
         )
-        meta_objective += lk_pg
+        objective_value = _as_float(meta_objective)
+        (loss_scale * meta_objective).backward()
 
-    meta_objective = (
-        ((lambda_auc * meta_objective) / budget)
-        + (lambda_tok * C_tok)
-        + (lambda_step * C_step)
-        + (lambda_drift * C_drift)
-        - (lambda_ent * C_ent)
-    )
-
-    meta_objective.backward()
-    
-    adamw_optimizer.step()
+    metrics = {
+        "initial_reward": initial_reward,
+        "best_reward": best_reward,
+        "final_reward": reward_history[-1],
+        "executed_steps": executed_steps,
+        "objective": objective_value,
+    }
+    return best_image, reward_history, metrics
