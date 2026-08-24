@@ -23,6 +23,8 @@ class MetaMilrOptimizer(nn.Module):
         self.h_alpha = nn.Linear(3 * e_k_dim, 1)
         self.alpha_t_max, self.alpha_i_max = 10, 10
 
+        self.h_q = nn.Linear(2 * e_k_dim, 1)
+
     def get_token_feature_vector(
         self, z_k_t, z_k_i, g_k_t, g_k_i, d_k_t_prev, d_k_i_prev, e_mod, e_pos
     ):
@@ -124,7 +126,8 @@ class MetaMilrOptimizer(nn.Module):
         return d_k_t, d_k_i, del_z_k
 
     def get_cont_prob(self):
-        pass
+        q_k = torch.sigmoid(self.h_q(torch.cat((self.s_k), -1)))
+        return q_k
 
     def forward(self, **kwargs):
 
