@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 import PIL.Image
@@ -331,6 +332,17 @@ def _latent_drift(text_states, image_states, initial_text_states, initial_image_
     )
 
 
+def _save_rollout_images(samples, step_dir, group):
+    group_dir = os.path.join(step_dir, group)
+    os.makedirs(group_dir, exist_ok=True)
+    paths = []
+    for sample_index, sample in enumerate(samples):
+        path = os.path.join(group_dir, f"{sample_index:02d}.png")
+        sample["image"].save(path)
+        paths.append(os.path.relpath(path, os.path.dirname(os.path.dirname(step_dir))))
+    return paths
+
+
 def meta_milr_optimized_generation(
     *,
     meta_milr_optimizer,
@@ -360,6 +372,7 @@ def meta_milr_optimized_generation(
     stop_threshold=0.5,
     train_meta=True,
     loss_scale=1.0,
+    example_output_dir=None,
 ):
     text_hidden_states = torch.stack(
         [state.detach().to(device) for state in text_hidden_states_list], dim=0
@@ -382,6 +395,13 @@ def meta_milr_optimized_generation(
     previous_reward = initial_reward
     best_reward = initial_reward
     best_image = image
+    reward_model_calls = 1
+    generated_samples = 1
+
+    if example_output_dir is not None:
+        images_dir = os.path.join(example_output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        image.save(os.path.join(images_dir, "initial.png"))
 
     query_losses = []
     token_cost = text_hidden_states.new_zeros((), dtype=torch.float32)
@@ -389,6 +409,26 @@ def meta_milr_optimized_generation(
     drift_cost = text_hidden_states.new_zeros((), dtype=torch.float32)
     routing_entropy = text_hidden_states.new_zeros((), dtype=torch.float32)
     executed_steps = 0
+    text_update_ratios = []
+    image_update_ratios = []
+    trajectory = [
+        {
+            "step": 0,
+            "reward": initial_reward,
+            "best_reward": initial_reward,
+            "continuation": 1.0,
+            "text_update_ratio": 0.0,
+            "image_update_ratio": 0.0,
+            "token_cost": 0.0,
+            "drift_cost": 0.0,
+            "routing_entropy": 0.0,
+            "support_rewards": [],
+            "query_rewards": [],
+            "support_images": [],
+            "query_images": [],
+            "initial_image": "images/initial.png" if example_output_dir else None,
+        }
+    ]
 
     for step_index in range(budget):
         support = rollout(
@@ -412,11 +452,18 @@ def meta_milr_optimized_generation(
             reward_baseline=reward_baseline,
             deterministic=False,
         )
+        reward_model_calls += len(support["samples"])
+        generated_samples += len(support["samples"])
+        step_dir = None
+        support_image_paths = []
+        if example_output_dir is not None:
+            step_dir = os.path.join(
+                example_output_dir, "images", f"step_{step_index + 1:02d}"
+            )
+            support_image_paths = _save_rollout_images(
+                support["samples"], step_dir, "support"
+            )
         reward_baseline = support["reward_baseline"]
-        for sample in support["samples"]:
-            if sample["reward"] > best_reward:
-                best_reward = sample["reward"]
-                best_image = sample["image"]
         reward_scale = support["std_reward"] if support["std_reward"] > 1e-8 else 1.0
         reward_feature = (current_reward - support["mean_reward"]) / reward_scale
         reward_delta = (current_reward - previous_reward) / reward_scale
@@ -487,6 +534,13 @@ def meta_milr_optimized_generation(
             reward_scale=reward_scale,
             deterministic=False,
         )
+        reward_model_calls += len(query["samples"])
+        generated_samples += len(query["samples"])
+        query_image_paths = []
+        if step_dir is not None:
+            query_image_paths = _save_rollout_images(
+                query["samples"], step_dir, "query"
+            )
         if train_meta:
             query_losses.append(query["loss"])
 
@@ -498,14 +552,41 @@ def meta_milr_optimized_generation(
                 best_reward = sample["reward"]
                 best_image = sample["image"]
 
-        token_cost = token_cost + optimizer_stats["token_cost"]
-        step_cost = step_cost + optimizer_stats["step_cost"]
-        routing_entropy = routing_entropy + optimizer_stats["routing_entropy"]
-        drift_cost = drift_cost + _latent_drift(
+        step_token_cost = optimizer_stats["token_cost"]
+        step_routing_entropy = optimizer_stats["routing_entropy"]
+        step_drift_cost = _latent_drift(
             next_text_states,
             next_image_states,
             initial_text_states,
             initial_image_states,
+        )
+        text_update_ratio = _as_float(optimizer_stats["text_mask"].mean())
+        image_update_ratio = _as_float(optimizer_stats["image_mask"].mean())
+        text_update_ratios.append(text_update_ratio)
+        image_update_ratios.append(image_update_ratio)
+
+        token_cost = token_cost + step_token_cost
+        step_cost = step_cost + optimizer_stats["step_cost"]
+        routing_entropy = routing_entropy + step_routing_entropy
+        drift_cost = drift_cost + step_drift_cost
+        trajectory.append(
+            {
+                "step": step_index + 1,
+                "reward": current_reward,
+                "best_reward": best_reward,
+                "continuation": continuation,
+                "text_update_ratio": text_update_ratio,
+                "image_update_ratio": image_update_ratio,
+                "token_cost": _as_float(step_token_cost),
+                "drift_cost": _as_float(step_drift_cost),
+                "routing_entropy": _as_float(step_routing_entropy),
+                "support_rewards": [
+                    sample["reward"] for sample in support["samples"]
+                ],
+                "query_rewards": [sample["reward"] for sample in query["samples"]],
+                "support_images": support_image_paths,
+                "query_images": query_image_paths,
+            }
         )
 
         text_hidden_states = next_text_states
@@ -534,5 +615,16 @@ def meta_milr_optimized_generation(
         "final_reward": reward_history[-1],
         "executed_steps": executed_steps,
         "objective": objective_value,
+        "token_cost": _as_float(token_cost),
+        "drift_cost": _as_float(drift_cost),
+        "routing_entropy": _as_float(routing_entropy),
+        "average_text_update_ratio": (
+            float(np.mean(text_update_ratios)) if text_update_ratios else 0.0
+        ),
+        "average_image_update_ratio": (
+            float(np.mean(image_update_ratios)) if image_update_ratios else 0.0
+        ),
+        "reward_model_calls": reward_model_calls,
+        "generated_samples": generated_samples,
     }
-    return best_image, reward_history, metrics
+    return best_image, reward_history, metrics, trajectory
