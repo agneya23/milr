@@ -93,6 +93,37 @@ def generate_image_from_prompt(
     return image
 
 stop_words = ["</s>", "<|im_end|>", "<|endoftext|>"]
+
+
+def _latent_drift(
+    text_states,
+    initial_text_states,
+    image_states,
+    initial_image_states,
+    total_tokens,
+):
+    drift = 0.0
+    if text_states is not None:
+        drift += (
+            (text_states.detach().float() - initial_text_states.float()).pow(2).sum().item()
+        )
+    if image_states is not None:
+        drift += (
+            (image_states.detach().float() - initial_image_states.float()).pow(2).sum().item()
+            / 2.0
+        )
+    return drift / max(total_tokens, 1)
+
+
+def _trajectory_record(step, reward, best_reward, latent_drift):
+    return {
+        "step": step,
+        "reward": float(reward),
+        "best_reward": float(best_reward),
+        "drift_cost": float(latent_drift),
+    }
+
+
 def optimized_generation(
     reward_model,
     image: PIL.Image,
@@ -133,6 +164,7 @@ def optimized_generation(
     Returns:
         final_image: PIL.Image
         reward_history: List[float]
+        trajectory: List[dict]
     """
     # Validate mode
     # assert optimize_mode in ("text", "image", "both"), "optimize_mode must be 'text', 'image', or 'both'"
@@ -145,6 +177,9 @@ def optimized_generation(
     print(f"-- Initial Image Reward: {initial_reward}")
     reward_history.append(initial_reward)
     current_reward = initial_reward
+    best_reward = initial_reward
+    trajectory = [_trajectory_record(0, initial_reward, initial_reward, 0.0)]
+    total_latent_tokens = len(text_hidden_states_list) + len(image_hidden_states_list)
 
     cot_prompt = (
         'You are asked to generate an image based on this prompt: "{}"\n'
@@ -175,7 +210,7 @@ def optimized_generation(
         
         if update_length <= 0:
             print("Update Length Zero!!!")
-            return None, reward_history, total, 0, update_length
+            return None, reward_history, total, 0, update_length, trajectory
 
         # 2. construct base_ids(prefix + start_index)，serving as starting point
         original_seq = []
@@ -188,6 +223,7 @@ def optimized_generation(
             ])
         )
         optimizer = torch.optim.Adam([optimized_states], lr=lr)
+        initial_optimized_states = optimized_states.detach().clone()
 
         input_ids = text_final_input_ids[:, : len(base_input_ids[-1]) + start_index]
         base_input_ids = input_ids.clone()
@@ -276,15 +312,26 @@ def optimized_generation(
             print(f"-- Text Branch New Reward: {new_reward}")
             reward_history.append(new_reward)
             current_reward = new_reward
+            best_reward = max(best_reward, new_reward)
+            latent_drift = _latent_drift(
+                optimized_states,
+                initial_optimized_states,
+                None,
+                None,
+                total_latent_tokens,
+            )
+            trajectory.append(
+                _trajectory_record(i + 1, new_reward, best_reward, latent_drift)
+            )
 
-        return new_img, reward_history, total, len(generated_seq), update_length
+        return new_img, reward_history, total, len(generated_seq), update_length, trajectory
     
     elif optimize_mode == "image":
         total = len(image_hidden_states_list)
         update_length = min(int(image_k * total), total)
         if update_length <= 0:
             print("Update Length Zero!!!")
-            return None, reward_history, total, 0, update_length
+            return None, reward_history, total, 0, update_length, trajectory
 
         # === Step 1: use processed image prompt embedding ===
         image_prompt_embed = image_prompt_embed.to(device)  # [1, T]
@@ -295,6 +342,7 @@ def optimized_generation(
             for s in image_hidden_states_list[start_index:start_index + update_length]
         ]))  # [update_len, H]
         optimizer = torch.optim.Adam([optimized_states], lr=lr)
+        initial_optimized_states = optimized_states.detach().clone()
 
         new_img = None
         for i in range(max_image_steps):
@@ -385,15 +433,26 @@ def optimized_generation(
 
             reward_history.append(new_reward)
             current_reward = new_reward
+            best_reward = max(best_reward, new_reward)
+            latent_drift = _latent_drift(
+                None,
+                None,
+                optimized_states,
+                initial_optimized_states,
+                total_latent_tokens,
+            )
+            trajectory.append(
+                _trajectory_record(i + 1, new_reward, best_reward, latent_drift)
+            )
 
-        return new_img, reward_history, total, image_token_num, update_length
+        return new_img, reward_history, total, image_token_num, update_length, trajectory
     
     elif optimize_mode == "image_random":
         total = len(image_hidden_states_list)
         update_length = min(int(image_k * total), total)
         if update_length <= 0:
             print("Update Length Zero!!!")
-            return None, reward_history, total, 0, update_length
+            return None, reward_history, total, 0, update_length, trajectory
 
         image_prompt_embed = image_prompt_embed.to(device)  # [1, T]
 
@@ -406,6 +465,7 @@ def optimized_generation(
             for s in image_hidden_states_list[start_index:start_index + update_length]
         ]))  # [update_len, H]
         optimizer = torch.optim.Adam([optimized_states], lr=lr)
+        initial_optimized_states = optimized_states.detach().clone()
 
         new_img = None
         for i in range(max_image_steps):
@@ -496,8 +556,19 @@ def optimized_generation(
 
             reward_history.append(new_reward)
             current_reward = new_reward
+            best_reward = max(best_reward, new_reward)
+            latent_drift = _latent_drift(
+                None,
+                None,
+                optimized_states,
+                initial_optimized_states,
+                total_latent_tokens,
+            )
+            trajectory.append(
+                _trajectory_record(i + 1, new_reward, best_reward, latent_drift)
+            )
 
-        return new_img, reward_history, total, image_token_num, update_length
+        return new_img, reward_history, total, image_token_num, update_length, trajectory
     
     # Branch: both
     else:  # "both"
@@ -510,7 +581,7 @@ def optimized_generation(
 
         if update_length <= 0:
             print("Update Length Zero!!!")
-            return None, reward_history, total, 0, update_length
+            return None, reward_history, total, 0, update_length, trajectory
 
         original_seq = []
         original_seq.extend(
@@ -527,13 +598,14 @@ def optimized_generation(
             )
         ) ### wrap in nn.Parameter the first update_length generated text token hidden states starting from start_index tokens beyond the cot prompt.
         optimizer_text = torch.optim.Adam([optimized_states], lr=lr)
+        initial_optimized_states = optimized_states.detach().clone()
 
         # ========== Step 2: image optimization ==========
         total_img = len(image_hidden_states_list)
         img_update_length = min(int(image_k * total_img), total_img)
         if img_update_length <= 0:
             print("Image Update Length Zero!!!")
-            return None, reward_history, total_img, 0, img_update_length
+            return None, reward_history, total_img, 0, img_update_length, trajectory
 
         optimized_states_img = torch.nn.Parameter(
             torch.stack(
@@ -544,6 +616,7 @@ def optimized_generation(
             )
         )
         optimizer_img = torch.optim.Adam([optimized_states_img], lr=lr)
+        initial_optimized_states_img = optimized_states_img.detach().clone()
 
         new_img = None
         generated_seq = []
@@ -681,6 +754,17 @@ def optimized_generation(
             print(f"-- Both branch new image reward: {new_reward}")
             reward_history.append(new_reward)
             current_reward = new_reward
+            best_reward = max(best_reward, new_reward)
+            latent_drift = _latent_drift(
+                optimized_states,
+                initial_optimized_states,
+                optimized_states_img,
+                initial_optimized_states_img,
+                total_latent_tokens,
+            )
+            trajectory.append(
+                _trajectory_record(i + 1, new_reward, best_reward, latent_drift)
+            )
             # ==================== Save trace ====================
             if save_base_path is not None:
                 os.makedirs(save_base_path, exist_ok=True)
@@ -704,4 +788,11 @@ def optimized_generation(
                     f.write("\n")
                 print(f"Trace saved: {trace_file}, image at: {img_save_path}")
 
-        return new_img, reward_history, total_img+total, image_token_num+len(generated_seq), img_update_length+update_length
+        return (
+            new_img,
+            reward_history,
+            total_img + total,
+            image_token_num + len(generated_seq),
+            img_update_length + update_length,
+            trajectory,
+        )

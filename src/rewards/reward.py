@@ -221,10 +221,9 @@ class RewardModel(object):
 
         except Exception as e:
             print(colored(f"[Error] Evaluation failed: {e}", "red"))
-            return 0
+            return -1
 
         finally:
             # 清理临时图片
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-

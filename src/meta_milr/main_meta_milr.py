@@ -49,10 +49,13 @@ def parse_args():
     parser.add_argument("--reward_model_type", type=str, default="geneval")
     parser.add_argument("--task_type", type=str, default="color")
     parser.add_argument("--train_frac", type=float, default=0.8)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--split_fraction", type=float, default=0.2)
+    parser.add_argument("--max_examples_per_split", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--checkpoint_path", type=str, default=None)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--milr_16_score", type=float, default=None)
 
@@ -103,10 +106,14 @@ def _validate_args(args):
         raise ValueError("model_name_or_path must be set")
     if not 0.0 < args.train_frac < 1.0:
         raise ValueError("train_frac must be strictly between 0 and 1")
+    if not 0.0 < args.split_fraction <= 1.0:
+        raise ValueError("split_fraction must be greater than 0 and at most 1")
     if args.epochs < 1 or args.batch_size < 1 or args.budget < 1:
         raise ValueError("epochs, batch_size, and budget must be at least 1")
     if args.num_support < 1 or args.num_query < 1:
         raise ValueError("num_support and num_query must be at least 1")
+    if args.max_examples_per_split is not None and args.max_examples_per_split < 1:
+        raise ValueError("max_examples_per_split must be at least 1")
     if args.optimize_mode not in ("text", "image", "both"):
         raise ValueError("optimize_mode must be text, image, or both")
     if args.data_name != "geneval":
@@ -122,6 +129,10 @@ def _validate_args(args):
         raise ValueError("routing_temperature_min cannot exceed routing_temperature")
     if args.eval_only and args.checkpoint_path is None:
         raise ValueError("eval_only requires checkpoint_path")
+    if args.resume and args.checkpoint_path is None:
+        raise ValueError("resume requires checkpoint_path")
+    if args.resume and args.eval_only:
+        raise ValueError("resume and eval_only cannot be used together")
     if args.milr_16_score is not None and not 0.0 <= args.milr_16_score <= 1.0:
         raise ValueError("milr_16_score must be between 0 and 1 for GenEval")
 
@@ -173,6 +184,49 @@ def _write_jsonl(path, records):
             output_file.write(json.dumps(record) + "\n")
 
 
+def _read_json(path):
+    with open(path, "r", encoding="utf-8") as input_file:
+        return json.load(input_file)
+
+
+def _save_checkpoint(
+    path,
+    next_epoch,
+    next_batch_start,
+    run_dir,
+    args,
+    meta_optimizer,
+    outer_optimizer,
+    best_validation_score,
+    best_epoch,
+):
+    checkpoint = {
+        "next_epoch": next_epoch,
+        "next_batch_start": next_batch_start,
+        "run_dir": os.path.abspath(run_dir),
+        "args": vars(args),
+        "meta_optimizer": meta_optimizer.state_dict(),
+        "outer_optimizer": outer_optimizer.state_dict(),
+        "best_validation_score": best_validation_score,
+        "best_epoch": best_epoch,
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    temporary_path = f"{path}.tmp"
+    torch.save(checkpoint, temporary_path)
+    os.replace(temporary_path, path)
+
+
+def _restore_rng_state(checkpoint):
+    random.setstate(checkpoint["python_rng_state"])
+    np.random.set_state(checkpoint["numpy_rng_state"])
+    torch.set_rng_state(checkpoint["torch_rng_state"])
+    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+
+
 def _stratified_geneval_split(dataset, train_frac, seed):
     categories = defaultdict(list)
     for source_index, example in enumerate(dataset):
@@ -196,6 +250,17 @@ def _stratified_geneval_split(dataset, train_frac, seed):
     return train, val
 
 
+def _seeded_subset(dataset, fraction, max_examples, seed):
+    sample_size = max(1, round(len(dataset) * fraction))
+    if max_examples is not None:
+        sample_size = min(sample_size, max_examples)
+    if sample_size >= len(dataset):
+        return dataset
+    generator = random.Random(seed)
+    selected_indices = generator.sample(range(len(dataset)), sample_size)
+    return [dataset[index] for index in selected_indices]
+
+
 def _prepare_datasets(args, run_dir):
     evaluation_data = get_dataset(args.dataset, args.task_type, args.data_name)
     train_data, val_data = _stratified_geneval_split(
@@ -204,6 +269,21 @@ def _prepare_datasets(args, run_dir):
     test_data = get_dataset(args.test_dataset, args.task_type, args.data_name)
     for source_index, example in enumerate(test_data):
         example["_source_index"] = source_index
+
+    source_sizes = {
+        "train": len(train_data),
+        "val": len(val_data),
+        "test": len(test_data),
+    }
+    train_data = _seeded_subset(
+        train_data, args.split_fraction, args.max_examples_per_split, args.seed + 1
+    )
+    val_data = _seeded_subset(
+        val_data, args.split_fraction, args.max_examples_per_split, args.seed + 2
+    )
+    test_data = _seeded_subset(
+        test_data, args.split_fraction, args.max_examples_per_split, args.seed + 3
+    )
 
     split_dir = os.path.join(run_dir, "splits")
     _write_jsonl(os.path.join(split_dir, "train.jsonl"), train_data)
@@ -220,14 +300,48 @@ def _prepare_datasets(args, run_dir):
             category_counts[example["tag"]] += 1
         split_summary[split_name] = {
             "num_examples": len(dataset),
+            "source_num_examples": source_sizes[split_name],
             "categories": dict(sorted(category_counts.items())),
         }
+    split_summary["seed"] = args.seed
+    split_summary["train_frac"] = args.train_frac
+    split_summary["split_fraction"] = args.split_fraction
+    split_summary["max_examples_per_split"] = args.max_examples_per_split
     _write_json(os.path.join(split_dir, "summary.json"), split_summary)
     return train_data, val_data, test_data
 
 
+def _load_run_datasets(args, run_dir):
+    split_dir = os.path.join(run_dir, "splits")
+    return tuple(
+        get_dataset(
+            os.path.join(split_dir, f"{split_name}.jsonl"),
+            args.task_type,
+            args.data_name,
+        )
+        for split_name in ("train", "val", "test")
+    )
+
+
 def _score_from_reward(reward, data_name):
     return reward + 1.0 if data_name == "geneval" else reward
+
+
+def _load_stage_summaries(stage_dir, dataset, completed_count):
+    summaries = []
+    for example in dataset[:completed_count]:
+        example_dir = os.path.join(
+            stage_dir, "examples", f"{example['_source_index']:06d}"
+        )
+        metrics_path = os.path.join(example_dir, "metrics.json")
+        trajectory_path = os.path.join(example_dir, "trajectory.json")
+        if not os.path.isfile(metrics_path) or not os.path.isfile(trajectory_path):
+            raise ValueError(f"Missing completed example artifacts in {example_dir}")
+        summary = _read_json(metrics_path)
+        summary["step_scores"] = summary["score_by_step"]
+        summary["trajectory"] = _read_json(trajectory_path)
+        summaries.append(summary)
+    return summaries
 
 
 def _padded_step_scores(reward_history, budget, data_name):
@@ -485,16 +599,20 @@ def _run_stage(
     outer_optimizer,
     device,
     train_meta,
+    start_index=0,
+    on_batch_complete=None,
 ):
     os.makedirs(stage_dir, exist_ok=True)
-    summaries = []
+    summaries = (
+        _load_stage_summaries(stage_dir, dataset, start_index) if start_index else []
+    )
     if train_meta:
         meta_optimizer.train()
     else:
         meta_optimizer.eval()
 
     for batch_start in tqdm(
-        range(0, len(dataset), args.batch_size), desc=stage_name
+        range(start_index, len(dataset), args.batch_size), desc=stage_name
     ):
         batch = dataset[batch_start : batch_start + args.batch_size]
         if train_meta:
@@ -623,6 +741,8 @@ def _run_stage(
         if train_meta:
             torch.nn.utils.clip_grad_norm_(meta_optimizer.parameters(), args.grad_clip)
             outer_optimizer.step()
+            if on_batch_complete is not None:
+                on_batch_complete(batch_start + len(batch))
 
     _write_jsonl(
         os.path.join(stage_dir, "examples.jsonl"),
@@ -639,13 +759,19 @@ def _run_stage(
 def main(args):
     _validate_args(args)
     set_seed(args.seed)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_label = f"{timestamp}_{args.run_name}" if args.run_name else timestamp
-    run_dir = os.path.join(args.output_dir, run_label)
-    os.makedirs(run_dir, exist_ok=False)
-    _write_json(os.path.join(run_dir, "config.json"), vars(args))
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+        run_dir = resume_checkpoint["run_dir"]
+        train_data, val_data, test_data = _load_run_datasets(args, run_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_label = f"{timestamp}_{args.run_name}" if args.run_name else timestamp
+        run_dir = os.path.join(args.output_dir, run_label)
+        os.makedirs(run_dir, exist_ok=False)
+        _write_json(os.path.join(run_dir, "config.json"), vars(args))
+        train_data, val_data, test_data = _prepare_datasets(args, run_dir)
 
-    train_data, val_data, test_data = _prepare_datasets(args, run_dir)
     device = torch.device(
         args.device
         if args.device is not None
@@ -675,18 +801,57 @@ def main(args):
         image_token_cost=args.image_token_cost,
     ).to(device)
     outer_optimizer = torch.optim.AdamW(meta_optimizer.parameters(), lr=args.lr)
-    if args.checkpoint_path is not None:
-        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = resume_checkpoint
+    if checkpoint is None and args.checkpoint_path is not None:
+        checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    if checkpoint is not None:
         meta_optimizer.load_state_dict(checkpoint["meta_optimizer"])
         if not args.eval_only and "outer_optimizer" in checkpoint:
             outer_optimizer.load_state_dict(checkpoint["outer_optimizer"])
+    if resume_checkpoint is not None:
+        _restore_rng_state(resume_checkpoint)
 
-    run_metrics = {}
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    latest_checkpoint_path = os.path.join(checkpoint_dir, "latest.pt")
+    best_checkpoint_path = os.path.join(checkpoint_dir, "best.pt")
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    run_metrics = _read_json(metrics_path) if os.path.isfile(metrics_path) else {}
+    best_validation_score = (
+        resume_checkpoint.get("best_validation_score", float("-inf"))
+        if resume_checkpoint is not None
+        else float("-inf")
+    )
+    best_epoch = (
+        resume_checkpoint.get("best_epoch") if resume_checkpoint is not None else None
+    )
+    start_epoch = (
+        resume_checkpoint.get("next_epoch", 1) if resume_checkpoint is not None else 1
+    )
+    start_batch = (
+        resume_checkpoint.get("next_batch_start", 0)
+        if resume_checkpoint is not None
+        else 0
+    )
+
     if not args.eval_only:
-        for epoch in range(1, args.epochs + 1):
+        run_metrics.pop("test", None)
+        for epoch in range(start_epoch, args.epochs + 1):
             epoch_dir = os.path.join(run_dir, "train", f"epoch_{epoch:03d}")
+
+            def save_latest(next_batch_start):
+                _save_checkpoint(
+                    latest_checkpoint_path,
+                    epoch,
+                    next_batch_start,
+                    run_dir,
+                    args,
+                    meta_optimizer,
+                    outer_optimizer,
+                    best_validation_score,
+                    best_epoch,
+                )
+
             run_metrics[f"train_epoch_{epoch:03d}"] = _run_stage(
                 args,
                 f"train_epoch_{epoch:03d}",
@@ -699,31 +864,82 @@ def main(args):
                 outer_optimizer,
                 device,
                 train_meta=True,
+                start_index=start_batch if epoch == start_epoch else 0,
+                on_batch_complete=save_latest,
             )
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "meta_optimizer": meta_optimizer.state_dict(),
-                    "outer_optimizer": outer_optimizer.state_dict(),
-                    "args": vars(args),
-                },
-                os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt"),
+            _write_json(metrics_path, run_metrics)
+
+            meta_optimizer.routing_temperature = args.routing_temperature_min
+            validation_metrics = _run_stage(
+                args,
+                f"val_epoch_{epoch:03d}",
+                val_data,
+                os.path.join(run_dir, "val", f"epoch_{epoch:03d}"),
+                vl_gpt,
+                vl_chat_processor,
+                reward_model,
+                meta_optimizer,
+                outer_optimizer,
+                device,
+                train_meta=False,
             )
+            run_metrics[f"val_epoch_{epoch:03d}"] = validation_metrics
+            validation_score = validation_metrics["mean_best_score"]
+            validation_improved = validation_score > best_validation_score
+            if validation_improved:
+                best_validation_score = validation_score
+                best_epoch = epoch
+            run_metrics["selection"] = {
+                "metric": "mean_best_score",
+                "best_epoch": best_epoch,
+                "best_validation_score": best_validation_score,
+            }
+            _write_json(metrics_path, run_metrics)
+            if validation_improved:
+                _save_checkpoint(
+                    best_checkpoint_path,
+                    epoch + 1,
+                    0,
+                    run_dir,
+                    args,
+                    meta_optimizer,
+                    outer_optimizer,
+                    best_validation_score,
+                    best_epoch,
+                )
+            _save_checkpoint(
+                latest_checkpoint_path,
+                epoch + 1,
+                0,
+                run_dir,
+                args,
+                meta_optimizer,
+                outer_optimizer,
+                best_validation_score,
+                best_epoch,
+            )
+            start_batch = 0
+
+        if not os.path.isfile(best_checkpoint_path):
+            raise RuntimeError("No best checkpoint was produced")
+        best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu")
+        meta_optimizer.load_state_dict(best_checkpoint["meta_optimizer"])
+    else:
+        run_metrics["val"] = _run_stage(
+            args,
+            "val",
+            val_data,
+            os.path.join(run_dir, "val"),
+            vl_gpt,
+            vl_chat_processor,
+            reward_model,
+            meta_optimizer,
+            outer_optimizer,
+            device,
+            train_meta=False,
+        )
 
     meta_optimizer.routing_temperature = args.routing_temperature_min
-    run_metrics["val"] = _run_stage(
-        args,
-        "val",
-        val_data,
-        os.path.join(run_dir, "val"),
-        vl_gpt,
-        vl_chat_processor,
-        reward_model,
-        meta_optimizer,
-        outer_optimizer,
-        device,
-        train_meta=False,
-    )
     run_metrics["test"] = _run_stage(
         args,
         "test",
@@ -737,7 +953,7 @@ def main(args):
         device,
         train_meta=False,
     )
-    _write_json(os.path.join(run_dir, "metrics.json"), run_metrics)
+    _write_json(metrics_path, run_metrics)
     print(f"Run outputs: {os.path.abspath(run_dir)}")
 
 
