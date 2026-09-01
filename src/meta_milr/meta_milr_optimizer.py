@@ -311,7 +311,7 @@ class MetaMilrOptimizer(nn.Module):
         update_t = text_mask.unsqueeze(-1) * update_t
         update_i = image_mask.view(-1, 1, 1) * update_i
 
-        continuation = torch.sigmoid(self.h_q(state)).squeeze()
+        continuation = state.new_ones(())
         z_k_t_next = z_k_t + (continuation * update_t).to(z_k_t.dtype)
         z_k_i_next = z_k_i + (continuation * update_i).to(z_k_i.dtype)
 

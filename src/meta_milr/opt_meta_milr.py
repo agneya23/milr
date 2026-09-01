@@ -411,6 +411,7 @@ def meta_milr_optimized_generation(
     executed_steps = 0
     text_update_ratios = []
     image_update_ratios = []
+    routing_decisions = []
     trajectory = [
         {
             "step": 0,
@@ -507,9 +508,25 @@ def meta_milr_optimized_generation(
             _as_float(optimizer_stats["text_mask"].sum()) == 0.0
             and _as_float(optimizer_stats["image_mask"].sum()) == 0.0
         )
-        if not train_meta and (
-            continuation < stop_threshold or both_masks_are_null
-        ):
+        routing_decisions.append(
+            {
+                "step": step_index + 1,
+                "text_mask_indices": optimizer_stats["text_mask"]
+                .nonzero()
+                .flatten()
+                .detach()
+                .cpu()
+                .tolist(),
+                "image_mask_indices": optimizer_stats["image_mask"]
+                .nonzero()
+                .flatten()
+                .detach()
+                .cpu()
+                .tolist(),
+                "both_masks_are_null": both_masks_are_null,
+            }
+        )
+        if not train_meta and both_masks_are_null:
             break
 
         query = rollout(
@@ -602,7 +619,6 @@ def meta_milr_optimized_generation(
             query_losses[-1]
             + lambda_auc * anytime_loss
             + lambda_tok * token_cost
-            + lambda_step * step_cost
             + lambda_drift * drift_cost
             - lambda_ent * routing_entropy
         )
@@ -626,5 +642,6 @@ def meta_milr_optimized_generation(
         ),
         "reward_model_calls": reward_model_calls,
         "generated_samples": generated_samples,
+        "routing_decisions": routing_decisions,
     }
     return best_image, reward_history, metrics, trajectory

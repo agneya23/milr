@@ -6,8 +6,8 @@ SRC_DIR="$(cd "$META_MILR_DIR/.." && pwd)"
 CONFIG_PATH="${META_MILR_CONFIG:-$META_MILR_DIR/configs/geneval.json}"
 LOG_DIR="$SRC_DIR/../outputs/meta_milr/logs"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="$LOG_DIR/${TIMESTAMP}_geneval.log"
-PID_FILE="$LOG_DIR/${TIMESTAMP}_geneval.pid"
+LOG_FILE="$LOG_DIR/${TIMESTAMP}_geneval_fixed_continuation.log"
+PID_FILE="$LOG_DIR/${TIMESTAMP}_geneval_fixed_continuation.pid"
 CONDA_ROOT="/ivi/zfs/s0/original_homes/ydu/miniconda3"
 CONDA_ENV="$CONDA_ROOT/envs/milr_latentseek"
 
@@ -17,7 +17,7 @@ source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-  python -m meta_milr.main_meta_milr \
+  python -u -m meta_milr.main_meta_milr \
   --config "$CONFIG_PATH" "$@" \
   >"$LOG_FILE" 2>&1 </dev/null &
 
