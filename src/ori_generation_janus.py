@@ -100,6 +100,9 @@ def original_generation(
         [sft_prompt], return_tensors="pt", padding=True, padding_side="right", add_special_tokens=True
     )
     current_input_ids = inputs.input_ids.to(device) ### Shape: [1, prompt_length]
+    text_attention_mask = inputs.attention_mask.to(device)
+    text_input_ids = current_input_ids
+    text_past_key_values = None
 
     text_hidden_states_list = [] ### contains the last layer hidden states of the generated text by the model ###
     generated_text_ids = [] ### contains newly generated text tokens by the lm_head
@@ -112,7 +115,14 @@ def original_generation(
     for _ in range(max_text_tokens):
         # generate normal outputs
         with torch.no_grad():
-            outputs = model.language_model.model(current_input_ids, output_hidden_states=True)
+            outputs = model.language_model.model(
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask,
+                use_cache=True,
+                past_key_values=text_past_key_values,
+                output_hidden_states=True,
+            )
+            text_past_key_values = outputs.past_key_values
         last_hidden_state = outputs[0][:, -1]  ### [B, sequence_length, hidden_dim] -> Gets the last layer hidden state of the newly generated text token (although not a token just yet...)
         text_hidden_states_list.append(last_hidden_state.clone())
         # detach + requires_grad
@@ -131,6 +141,10 @@ def original_generation(
                 break
 
             current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=-1)
+            text_input_ids = next_token_id.unsqueeze(0)
+            text_attention_mask = torch.cat(
+                (text_attention_mask, text_attention_mask.new_ones((1, 1))), dim=1
+            )
 
     # final answer
     text_final_input_ids = current_input_ids.clone().clone().cpu() ### The whole text: cot prompt + generated text

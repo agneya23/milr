@@ -599,6 +599,7 @@ def _run_stage(
     outer_optimizer,
     device,
     train_meta,
+    original_cache=None,
     start_index=0,
     on_batch_complete=None,
 ):
@@ -626,26 +627,45 @@ def _run_stage(
             source_index = example["_source_index"]
             example_dir = os.path.join(stage_dir, "examples", f"{source_index:06d}")
             os.makedirs(example_dir, exist_ok=True)
-            (
-                original_image,
-                text_hidden_states_list,
-                _,
-                image_hidden_states_list,
-                _,
-                ori_image_prompt,
-            ) = original_generation(
-                input_text=example["prompt"],
-                model=vl_gpt,
-                vl_chat_processor=vl_chat_processor,
-                optimize_mode=args.optimize_mode,
-                device=device,
-                max_text_tokens=args.max_new_tokens,
-                image_token_num=args.image_token_num,
-                img_size=args.img_size,
-                patch_size=args.patch_size,
-                cfg_weight=args.cfg_weight,
-                temperature=args.temperature,
+            cached_original = (
+                original_cache.get(source_index) if original_cache is not None else None
             )
+            if cached_original is None:
+                (
+                    original_image,
+                    text_hidden_states_list,
+                    _,
+                    image_hidden_states_list,
+                    _,
+                    ori_image_prompt,
+                ) = original_generation(
+                    input_text=example["prompt"],
+                    model=vl_gpt,
+                    vl_chat_processor=vl_chat_processor,
+                    optimize_mode=args.optimize_mode,
+                    device=device,
+                    max_text_tokens=args.max_new_tokens,
+                    image_token_num=args.image_token_num,
+                    img_size=args.img_size,
+                    patch_size=args.patch_size,
+                    cfg_weight=args.cfg_weight,
+                    temperature=args.temperature,
+                )
+                if original_cache is not None:
+                    original_cache[source_index] = (
+                        original_image.copy(),
+                        torch.stack(text_hidden_states_list).detach().cpu(),
+                        torch.stack(image_hidden_states_list).detach().cpu(),
+                        ori_image_prompt,
+                    )
+            else:
+                (
+                    original_image,
+                    text_hidden_states_list,
+                    image_hidden_states_list,
+                    ori_image_prompt,
+                ) = cached_original
+                original_image = original_image.copy()
 
             final_image, reward_history, metrics, trajectory = (
                 meta_milr_optimized_generation(
@@ -833,6 +853,7 @@ def main(args):
         if resume_checkpoint is not None
         else 0
     )
+    original_caches = {"train": {}, "val": {}, "test": {}}
 
     if not args.eval_only:
         run_metrics.pop("test", None)
@@ -864,6 +885,7 @@ def main(args):
                 outer_optimizer,
                 device,
                 train_meta=True,
+                original_cache=original_caches["train"],
                 start_index=start_batch if epoch == start_epoch else 0,
                 on_batch_complete=save_latest,
             )
@@ -882,6 +904,7 @@ def main(args):
                 outer_optimizer,
                 device,
                 train_meta=False,
+                original_cache=original_caches["val"],
             )
             run_metrics[f"val_epoch_{epoch:03d}"] = validation_metrics
             validation_score = validation_metrics["mean_best_score"]
@@ -937,6 +960,7 @@ def main(args):
             outer_optimizer,
             device,
             train_meta=False,
+            original_cache=original_caches["val"],
         )
 
     meta_optimizer.routing_temperature = args.routing_temperature_min
@@ -952,6 +976,7 @@ def main(args):
         outer_optimizer,
         device,
         train_meta=False,
+        original_cache=original_caches["test"],
     )
     _write_json(metrics_path, run_metrics)
     print(f"Run outputs: {os.path.abspath(run_dir)}")

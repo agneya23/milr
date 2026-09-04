@@ -18,30 +18,50 @@ def _categorical_sample(probabilities, deterministic=False):
     return torch.multinomial(probabilities, num_samples=1).squeeze(-1)
 
 
+def _categorical_sequences(probabilities, num_samples, deterministic=False):
+    if deterministic:
+        return probabilities.argmax(dim=-1).unsqueeze(0).expand(num_samples, -1)
+    return torch.multinomial(
+        probabilities, num_samples=num_samples, replacement=True
+    ).transpose(0, 1)
+
+
 def _entropy(probabilities):
     return -(probabilities * torch.log(probabilities + 1e-8)).sum(dim=-1)
 
 
 @torch.no_grad()
-def _image_prompt_embeddings(model, vl_chat_processor, prompt, device):
-    conversation = [
-        {"role": "User", "content": prompt},
-        {"role": "Assistant", "content": ""},
-    ]
-    sft_prompt = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
-        conversations=conversation,
-        sft_format=vl_chat_processor.sft_format,
-        system_prompt="",
-    )
-    prompt_inputs = vl_chat_processor.tokenizer(
-        text=[sft_prompt],
-        return_tensors="pt",
-        padding=True,
-        padding_side="right",
-        add_special_tokens=True,
-    )
+def _image_prompt_embeddings(model, vl_chat_processor, prompts, device):
+    sft_prompts = []
+    for prompt in prompts:
+        conversation = [
+            {"role": "User", "content": prompt},
+            {"role": "Assistant", "content": ""},
+        ]
+        sft_prompts.append(
+            vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
+                conversations=conversation,
+                sft_format=vl_chat_processor.sft_format,
+                system_prompt="",
+            )
+        )
+
+    tokenizer = vl_chat_processor.tokenizer
+    previous_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        prompt_inputs = tokenizer(
+            text=sft_prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=True,
+        )
+    finally:
+        tokenizer.padding_side = previous_padding_side
+
     image_prompt_ids = prompt_inputs["input_ids"].to(device)
-    image_start_ids = vl_chat_processor.tokenizer.encode(
+    attention_mask = prompt_inputs["attention_mask"].to(device)
+    image_start_ids = tokenizer.encode(
         vl_chat_processor.image_start_tag, add_special_tokens=False
     )
     image_prompt_ids = torch.cat(
@@ -51,20 +71,31 @@ def _image_prompt_embeddings(model, vl_chat_processor, prompt, device):
         ),
         dim=1,
     )
+    attention_mask = torch.cat(
+        (attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))),
+        dim=1,
+    )
 
     embedding_layer = model.language_model.get_input_embeddings()
     conditional = embedding_layer(image_prompt_ids)
     pad_ids = image_prompt_ids.new_full((1, 1), vl_chat_processor.pad_id)
     pad_embedding = embedding_layer(pad_ids)
-    unconditional = conditional.clone()
-    unconditional[:, 1:-1] = pad_embedding
-    return torch.cat((conditional, unconditional), dim=0)
+    unconditional = pad_embedding.expand_as(conditional).clone()
+    rows = torch.arange(conditional.shape[0], device=device)
+    first_tokens = attention_mask.argmax(dim=1)
+    unconditional[rows, first_tokens] = conditional[rows, first_tokens]
+    unconditional[:, -1] = conditional[:, -1]
+
+    paired_embeddings = torch.stack((conditional, unconditional), dim=1).flatten(0, 1)
+    paired_attention_mask = attention_mask.repeat_interleave(2, dim=0)
+    return paired_embeddings, paired_attention_mask
 
 
 @torch.no_grad()
 def _generate_image_suffix(
     model,
     prompt_embeddings,
+    prompt_attention_mask,
     prefix_token_ids,
     device,
     cfg_weight,
@@ -74,19 +105,27 @@ def _generate_image_suffix(
     patch_size,
     deterministic=False,
 ):
-    prefix_length = prefix_token_ids.numel()
+    batch_size, prefix_length = prefix_token_ids.shape
     generated_tokens = torch.zeros(
-        (1, image_token_num), dtype=torch.int, device=device
+        (batch_size, image_token_num), dtype=torch.int, device=device
     )
 
     if prefix_length:
         generated_tokens[:, :prefix_length] = prefix_token_ids
-        paired_ids = prefix_token_ids.unsqueeze(-1).expand(-1, 2).reshape(-1)
+        paired_ids = prefix_token_ids.unsqueeze(1).expand(-1, 2, -1).reshape(-1)
         prefix_embeddings = model.prepare_gen_img_embeds(paired_ids)
-        prefix_embeddings = prefix_embeddings.reshape(prefix_length, 2, -1).permute(1, 0, 2)
+        prefix_embeddings = prefix_embeddings.reshape(batch_size * 2, prefix_length, -1)
         current_embeddings = torch.cat((prompt_embeddings, prefix_embeddings), dim=1)
+        attention_mask = torch.cat(
+            (
+                prompt_attention_mask,
+                prompt_attention_mask.new_ones((batch_size * 2, prefix_length)),
+            ),
+            dim=1,
+        )
     else:
         current_embeddings = prompt_embeddings
+        attention_mask = prompt_attention_mask
 
     outputs = None
     for position in range(prefix_length, image_token_num):
@@ -94,6 +133,7 @@ def _generate_image_suffix(
             inputs_embeds=current_embeddings,
             use_cache=True,
             past_key_values=outputs.past_key_values if outputs is not None else None,
+            attention_mask=attention_mask,
         )
         hidden_state = outputs.last_hidden_state[:, -1, :]
         logits = model.gen_head(hidden_state)
@@ -108,17 +148,20 @@ def _generate_image_suffix(
 
         paired_token = next_token.unsqueeze(-1).expand(-1, 2).reshape(-1)
         current_embeddings = model.prepare_gen_img_embeds(paired_token).unsqueeze(1)
+        attention_mask = torch.cat(
+            (attention_mask, attention_mask.new_ones((batch_size * 2, 1))), dim=1
+        )
 
     decoded = model.gen_vision_model.decode_code(
         generated_tokens,
-        shape=[1, 8, img_size // patch_size, img_size // patch_size],
+        shape=[batch_size, 8, img_size // patch_size, img_size // patch_size],
     )
     decoded = decoded.detach().float().cpu().numpy().transpose(0, 2, 3, 1)
     decoded = np.clip((decoded + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
-    return PIL.Image.fromarray(decoded[0])
+    return [PIL.Image.fromarray(item) for item in decoded]
 
 
-def _sample_generation(
+def _sample_generations(
     model,
     vl_chat_processor,
     reward_model,
@@ -133,35 +176,38 @@ def _sample_generation(
     image_token_num,
     img_size,
     patch_size,
+    num_samples,
     deterministic=False,
 ):
     zero = text_hidden_states.sum() * 0.0 + image_hidden_states.sum() * 0.0
-    text_log_probability = zero
-    image_log_probability = zero
+    text_log_probabilities = zero.repeat(num_samples)
+    image_log_probabilities = zero.repeat(num_samples)
     text_entropy = text_hidden_states.new_zeros(text_hidden_states.shape[0], dtype=torch.float32)
     image_entropy = image_hidden_states.new_zeros(image_hidden_states.shape[0], dtype=torch.float32)
 
     if optimize_mode != "image":
         text_logits = model.language_model.lm_head(text_hidden_states)
         text_probabilities = torch.softmax(text_logits.float(), dim=-1)
-        text_token_ids = _categorical_sample(
-            text_probabilities, deterministic=deterministic
+        text_token_ids = _categorical_sequences(
+            text_probabilities, num_samples, deterministic=deterministic
         )
-        text_log_probability = torch.log(
-            text_probabilities[
-                torch.arange(text_hidden_states.shape[0], device=device), text_token_ids
-            ]
-            + 1e-8
-        ).sum()
+        selected_probabilities = text_probabilities.gather(
+            1, text_token_ids.transpose(0, 1)
+        )
+        text_log_probabilities = torch.log(selected_probabilities + 1e-8).sum(dim=0)
         text_entropy = _entropy(text_probabilities)
-        enhanced_text = vl_chat_processor.tokenizer.decode(
+        enhanced_texts = vl_chat_processor.tokenizer.batch_decode(
             text_token_ids.detach().cpu().tolist(), skip_special_tokens=True
         )
-        image_prompt = f"{data['prompt']}. {enhanced_text}"
+        image_prompts = [
+            f"{data['prompt']}. {enhanced_text}" for enhanced_text in enhanced_texts
+        ]
     else:
-        image_prompt = ori_image_prompt
+        image_prompts = [ori_image_prompt] * num_samples
 
-    prefix_token_ids = torch.empty(0, dtype=torch.long, device=device)
+    prefix_token_ids = torch.empty(
+        (num_samples, 0), dtype=torch.long, device=device
+    )
     if optimize_mode != "text":
         prefix_length = min(
             image_hidden_states.shape[0],
@@ -174,23 +220,22 @@ def _sample_generation(
             conditional_logits - unconditional_logits
         )
         image_probabilities = torch.softmax(fused_logits / temperature, dim=-1)
-        prefix_token_ids = _categorical_sample(
-            image_probabilities, deterministic=deterministic
+        prefix_token_ids = _categorical_sequences(
+            image_probabilities, num_samples, deterministic=deterministic
         )
-        image_log_probability = torch.log(
-            image_probabilities[
-                torch.arange(prefix_length, device=device), prefix_token_ids
-            ]
-            + 1e-8
-        ).sum()
+        selected_probabilities = image_probabilities.gather(
+            1, prefix_token_ids.transpose(0, 1)
+        )
+        image_log_probabilities = torch.log(selected_probabilities + 1e-8).sum(dim=0)
         image_entropy[:prefix_length] = _entropy(image_probabilities)
 
-    prompt_embeddings = _image_prompt_embeddings(
-        model, vl_chat_processor, image_prompt, device
+    prompt_embeddings, prompt_attention_mask = _image_prompt_embeddings(
+        model, vl_chat_processor, image_prompts, device
     )
-    image = _generate_image_suffix(
+    images = _generate_image_suffix(
         model=model,
         prompt_embeddings=prompt_embeddings,
+        prompt_attention_mask=prompt_attention_mask,
         prefix_token_ids=prefix_token_ids.detach(),
         device=device,
         cfg_weight=cfg_weight,
@@ -200,14 +245,18 @@ def _sample_generation(
         patch_size=patch_size,
         deterministic=deterministic,
     )
-    reward = _as_float(reward_model.get_reward(image, data))
-    return {
-        "log_probability": text_log_probability + image_log_probability,
-        "reward": reward,
-        "image": image,
-        "text_entropy": text_entropy,
-        "image_entropy": image_entropy,
-    }
+    rewards = [_as_float(reward_model.get_reward(image, data)) for image in images]
+    return [
+        {
+            "log_probability": text_log_probabilities[index]
+            + image_log_probabilities[index],
+            "reward": rewards[index],
+            "image": images[index],
+            "text_entropy": text_entropy,
+            "image_entropy": image_entropy,
+        }
+        for index in range(num_samples)
+    ]
 
 
 def rollout(
@@ -243,28 +292,25 @@ def rollout(
         rollout_text_states = text_hidden_states
         rollout_image_states = image_hidden_states
 
-    samples = []
     with torch.enable_grad():
-        for _ in range(num_samples):
-            samples.append(
-                _sample_generation(
-                    model=model,
-                    vl_chat_processor=vl_chat_processor,
-                    reward_model=reward_model,
-                    data=data,
-                    text_hidden_states=rollout_text_states,
-                    image_hidden_states=rollout_image_states,
-                    ori_image_prompt=ori_image_prompt,
-                    optimize_mode=optimize_mode,
-                    device=device,
-                    cfg_weight=cfg_weight,
-                    temperature=temperature,
-                    image_token_num=image_token_num,
-                    img_size=img_size,
-                    patch_size=patch_size,
-                    deterministic=deterministic,
-                )
-            )
+        samples = _sample_generations(
+            model=model,
+            vl_chat_processor=vl_chat_processor,
+            reward_model=reward_model,
+            data=data,
+            text_hidden_states=rollout_text_states,
+            image_hidden_states=rollout_image_states,
+            ori_image_prompt=ori_image_prompt,
+            optimize_mode=optimize_mode,
+            device=device,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            image_token_num=image_token_num,
+            img_size=img_size,
+            patch_size=patch_size,
+            num_samples=num_samples,
+            deterministic=deterministic,
+        )
 
         rewards = [sample["reward"] for sample in samples]
         if mode == "support":
@@ -374,13 +420,21 @@ def meta_milr_optimized_generation(
     loss_scale=1.0,
     example_output_dir=None,
 ):
-    text_hidden_states = torch.stack(
-        [state.detach().to(device) for state in text_hidden_states_list], dim=0
+    text_hidden_states = (
+        text_hidden_states_list.detach().to(device)
+        if torch.is_tensor(text_hidden_states_list)
+        else torch.stack(
+            [state.detach().to(device) for state in text_hidden_states_list], dim=0
+        )
     )
     if text_hidden_states.ndim == 3 and text_hidden_states.shape[1] == 1:
         text_hidden_states = text_hidden_states[:, 0, :]
-    image_hidden_states = torch.stack(
-        [state.detach().to(device) for state in image_hidden_states_list], dim=0
+    image_hidden_states = (
+        image_hidden_states_list.detach().to(device)
+        if torch.is_tensor(image_hidden_states_list)
+        else torch.stack(
+            [state.detach().to(device) for state in image_hidden_states_list], dim=0
+        )
     )
 
     initial_text_states = text_hidden_states.detach().clone()
